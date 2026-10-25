@@ -774,24 +774,36 @@ mem_total_kb() {
   awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null
 }
 
-# 名单大小上限跟着内存走。小鸡仍是 3MB、20000 条；
-# 内存大一些的机器可以吃下整份去广告名单（常见的有 10MB、30 万条）。
+# 名单上限。临时文件放在硬盘上，名单大小本身不占内存；
+# 真正吃内存的是 dnsmasq 里的域名，每条大约一百字节。
+# 64MB 小鸡放 10 万条，大一些的机器可以吃下整份去广告名单（常见的有 30 万条）。
 list_limits() {
   kb=$(mem_total_kb)
   case ${kb:-} in
     ''|*[!0-9]*) kb=0 ;;
   esac
-  if [ "$kb" -gt 786432 ]; then
-    LIST_MAX_MB=32
-    LIST_MAX_ITEMS=500000
-  elif [ "$kb" -gt 196608 ]; then
-    LIST_MAX_MB=12
-    LIST_MAX_ITEMS=150000
-  else
-    LIST_MAX_MB=3
-    LIST_MAX_ITEMS=20000
-  fi
+  LIST_MAX_MB=32
   LIST_MAX_BYTES=$((LIST_MAX_MB * 1048576))
+  if [ "$kb" -gt 196608 ]; then
+    LIST_MAX_ITEMS=500000
+  else
+    LIST_MAX_ITEMS=100000
+  fi
+}
+
+# 临时目录。很多系统的 /tmp 是内存盘，几 MB 的名单复制几份就能把小鸡挤爆，
+# 所以尽量放到硬盘上。
+pick_tmpdir() {
+  for d in "${TMPDIR:-}" /var/tmp /root /tmp; do
+    [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] || continue
+    fs=$(df -P "$d" 2>/dev/null | awk 'NR == 2 { print $1 }')
+    case $fs in
+      tmpfs|ramfs|none) [ "$d" = /tmp ] || continue ;;
+    esac
+    printf '%s\n' "$d"
+    return 0
+  done
+  printf '%s\n' /tmp
 }
 
 lowmem_prepare() {
@@ -1273,7 +1285,9 @@ write_dnsmasq_conf() {
       fi
     fi
     # 名单可能有几十万行，用 awk 写，shell 逐行太慢。
-    awk 'NF { print "address=/" $1 "/0.0.0.0"; print "address=/" $1 "/::" }' "$CFG/dns.list"
+    # 不写地址的 address=/域名/ 对 IPv4、IPv6 都回“不存在”，子域名一起拦。
+    # 一个域名一行，比分别写 0.0.0.0 和 :: 省一半内存。
+    awk 'NF { print "address=/" $1 "/" }' "$CFG/dns.list"
   } >"$dest"
 }
 
@@ -1514,14 +1528,23 @@ rebuild_ips() {
   : >"$WORKDIR/v4.raw"
   : >"$WORKDIR/v6.raw"
   : >"$WORKDIR/names.txt"
-  awk -F '\t' '
-    $1 == "ip4" || $1 == "net4" { print $2 >> "'"$WORKDIR"'/v4.raw" }
-    $1 == "ip6" || $1 == "net6" { print $2 >> "'"$WORKDIR"'/v6.raw" }
-    $1 == "domain" { print $2 >> "'"$WORKDIR"'/names.txt" }
-    $1 == "suffix" {
-      print $2 >> "'"$WORKDIR"'/names.txt"
-      if ($2 !~ /^www\./) print "www." $2 >> "'"$WORKDIR"'/names.txt"
+  # 最多只解析 2000 个名字。写的时候就截住，免得几十万行先排一遍序，小鸡内存吃不消。
+  awk -F '\t' -v cap=2000 -v w="$WORKDIR" '
+    function name(s) {
+      if (c >= cap) { more++; return }
+      if (s in seen) return
+      seen[s] = 1
+      c++
+      print s >> (w "/names.txt")
     }
+    $1 == "ip4" || $1 == "net4" { print $2 >> (w "/v4.raw") }
+    $1 == "ip6" || $1 == "net6" { print $2 >> (w "/v6.raw") }
+    $1 == "domain" { name($2) }
+    $1 == "suffix" {
+      name($2)
+      if ($2 !~ /^www\./) name("www." $2)
+    }
+    END { print c + more > (w "/names.count") }
   ' "$CFG/list.txt"
   if [ -s "$WORKDIR/names.txt" ]; then
     LC_ALL=C sort -u "$WORKDIR/names.txt" -o "$WORKDIR/names.txt"
@@ -1543,11 +1566,8 @@ rebuild_ips() {
   : >"$WORKDIR/resolved.txt"
   total=$(wc -l <"$WORKDIR/names.txt" | awk '{ print $1 }')
   [ -n "$total" ] || total=0
-  if [ "$total" -gt 2000 ]; then
+  if [ "$(cat "$WORKDIR/names.count" 2>/dev/null || echo 0)" -gt 2000 ]; then
     say_warn "域名超过 2000 个，只解析前 2000 个的 IP。"
-    head -n 2000 "$WORKDIR/names.txt" >"$WORKDIR/names.cap"
-    cat "$WORKDIR/names.cap" >"$WORKDIR/names.txt"
-    total=2000
   fi
   n=0
   failn=0
@@ -1961,22 +1981,41 @@ classify_raw() {
   raw=$1
   out=$2
   fengjin_awk classify <"$raw" >"$WORKDIR/class.all"
-  awk -F '\t' '$1 == "bad" { print }' "$WORKDIR/class.all" >"$WORKDIR/class.bad"
-  awk -F '\t' '$1 != "bad" { print }' "$WORKDIR/class.all" | LC_ALL=C sort -u >"$out"
-  cat "$WORKDIR/class.bad" >>"$WORKDIR/class.preview"
-  cp "$out" "$WORKDIR/class.good"
+  # 先截掉超出上限的域名再排序。sort 要把整份读进内存，
+  # 30 万行要 30MB，64MB 小鸡受不了；截到 10 万行只要三分之一。
+  list_limits
+  : >"$WORKDIR/class.bad"
+  : >"$WORKDIR/class.ips"
+  : >"$WORKDIR/class.names"
+  awk -F '\t' -v cap="$LIST_MAX_ITEMS" -v w="$WORKDIR" '
+    $1 == "bad" { print > (w "/class.bad"); next }
+    $1 == "domain" || $1 == "suffix" {
+      n++
+      if (n <= cap) print > (w "/class.names")
+      next
+    }
+    { print > (w "/class.ips") }
+    END { print n + 0 > (w "/class.nnames") }
+  ' "$WORKDIR/class.all"
+  nn=$(cat "$WORKDIR/class.nnames" 2>/dev/null || echo 0)
+  if [ "$nn" -gt "$LIST_MAX_ITEMS" ]; then
+    say_warn "名单里有 $nn 个域名，这台机器最多用 $LIST_MAX_ITEMS 个，后面的不用。"
+  fi
+  cat "$WORKDIR/class.ips" "$WORKDIR/class.names" | LC_ALL=C sort -u >"$out"
 }
 
 cap_list() {
   list=$1
   list_limits
-  n=$(wc -l <"$list" | awk '{ print $1 }')
+  # 上限只算域名，吃内存的是 dnsmasq 里的域名。IP 进 ipset，全部保留。
+  n=$(awk -F '\t' '$1 == "domain" || $1 == "suffix" { c++ } END { print c + 0 }' "$list")
   if [ "${n:-0}" -gt "$LIST_MAX_ITEMS" ]; then
-    say_warn "超过 $LIST_MAX_ITEMS 条，这台机器只保留前 $LIST_MAX_ITEMS 条。"
-    # IP 和网段排在前面，先保住它们。
-    awk -F '\t' '$1 != "domain" && $1 != "suffix"' "$list" >"$WORKDIR/list.cap"
-    awk -F '\t' '$1 == "domain" || $1 == "suffix"' "$list" >>"$WORKDIR/list.cap"
-    head -n "$LIST_MAX_ITEMS" "$WORKDIR/list.cap" >"$list"
+    say_warn "域名超过 $LIST_MAX_ITEMS 个，这台机器只保留前 $LIST_MAX_ITEMS 个。"
+    awk -F '\t' -v cap="$LIST_MAX_ITEMS" '
+      $1 == "domain" || $1 == "suffix" { if (++c > cap) next }
+      { print }
+    ' "$list" >"$WORKDIR/list.cap"
+    cat "$WORKDIR/list.cap" >"$list"
   fi
 }
 
@@ -2149,7 +2188,6 @@ cmd_check() {
   [ -f "$file" ] || die "找不到文件。"
   fengjin_awk classify <"$file" >"$WORKDIR/check.all"
   awk -F '\t' '$1 != "bad"' "$WORKDIR/check.all" | LC_ALL=C sort -u >"$WORKDIR/check.good"
-  cat "$WORKDIR/check.all" >"$WORKDIR/class.preview"
   summarize_list "$WORKDIR/check.all"
   printf '域名 %s 个，整段后缀 %s 个，IP / 网段 %s 个，跳过 %s 行\n' \
     "$N_DOMAIN" "$N_SUFFIX" "$N_IP" "$N_BAD"
@@ -2184,7 +2222,6 @@ activate() {
 wizard() {
   raw=$WORKDIR/raw.txt
   collect_sources "$raw"
-  : >"$WORKDIR/class.preview"
   classify_raw "$raw" "$WORKDIR/good.txt"
   summarize_list "$WORKDIR/good.txt"
   N_BAD=$(awk -F '\t' '$1 == "bad" { c++ } END { print c + 0 }' "$WORKDIR/class.all")
@@ -2427,7 +2464,7 @@ cmd_apply_rules() {
 
 main() {
   umask 022
-  WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/vps-fengjin.XXXXXX" 2>/dev/null || true)
+  WORKDIR=$(mktemp -d "$(pick_tmpdir)/vps-fengjin.XXXXXX" 2>/dev/null || true)
   if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
     WORKDIR=/tmp/vps-fengjin.$$
     mkdir -p "$WORKDIR" || exit 1
