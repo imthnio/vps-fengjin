@@ -229,6 +229,44 @@ function v6_contains(net, ip,   a, base, bits, eb, ei, full, rem, sh, nb, ni) {
   sh = 2 ^ (4 - rem)
   return int(nb / sh) == int(ni / sh)
 }
+function v6_network(s, bits,   e, full, rem, out, nb, sh, i, g, best, bestlen, run, start, text) {
+  e = v6_expand(s)
+  if (e == "") return ""
+  full = int(bits / 4)
+  rem = bits % 4
+  out = substr(e, 1, full)
+  if (rem > 0) {
+    nb = hexval(substr(e, full + 1, 1))
+    sh = 2 ^ (4 - rem)
+    out = out sprintf("%x", int(nb / sh) * sh)
+  }
+  while (length(out) < 32) out = out "0"
+  # 压缩成常见写法：去掉前导 0，最长的一段全 0 写成 ::
+  best = 0
+  bestlen = 0
+  run = 0
+  for (i = 1; i <= 8; i++) {
+    g[i] = substr(out, i * 4 - 3, 4)
+    sub(/^0+/, "", g[i])
+    if (g[i] == "") g[i] = "0"
+    if (g[i] == "0") {
+      if (run == 0) start = i
+      run++
+      if (run > bestlen) { best = start; bestlen = run }
+    } else run = 0
+  }
+  if (bestlen < 2) best = 0
+  text = ""
+  for (i = 1; i <= 8; i++) {
+    if (best > 0 && i >= best && i < best + bestlen) {
+      if (i == best) text = text "::"
+      continue
+    }
+    if (text != "" && text !~ /::$/) text = text ":"
+    text = text g[i]
+  }
+  return text
+}
 function v6_special(s,   e) {
   e = v6_expand(s)
   if (e == "") return 1
@@ -248,6 +286,8 @@ function is_domain(s,   n, i, lab) {
     if (length(lab[i]) < 1 || length(lab[i]) > 63) return 0
     if (lab[i] !~ /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) return 0
   }
+  # 顶级域不会是纯数字。hosts 名单里的 "0.0.0.0 0.0.0.0" 这类行不能当域名。
+  if (lab[n] ~ /^[0-9]+$/) return 0
   return 1
 }
 function is_sink(s) {
@@ -289,7 +329,10 @@ function emit_addr(s,   n, a, left, bits, net) {
       if ((bits + 0) < 32) { bad("wide", s); return }
       left = tolower(left)
       if (v6_special(left)) { bad("local", s); return }
-      print "net6\t" left "/" (bits + 0)
+      # 和 IPv4 一样把主机位清零。nft 的区间集合不接受带主机位的网段。
+      net = v6_network(left, bits + 0)
+      if (v6_special(net)) { bad("local", s); return }
+      print "net6\t" net "/" (bits + 0)
       return
     }
     bad("parse", s)
@@ -566,7 +609,8 @@ function render_rules(   mode_s, ports_s, method, list, setname, mspec, addr, li
         if (line == "") continue
         h = wire_hex(line)
         if (h == "" || length(h) > 240) continue
-        emit_string(h)
+        # 末尾带上 00 结束符：example.com 不会误拦 example.com.cn，子域名照样拦。
+        emit_string(h "00")
       }
       close(plan "/dns.list")
     }
@@ -730,6 +774,26 @@ mem_total_kb() {
   awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null
 }
 
+# 名单大小上限跟着内存走。小鸡仍是 3MB、20000 条；
+# 内存大一些的机器可以吃下整份去广告名单（常见的有 10MB、30 万条）。
+list_limits() {
+  kb=$(mem_total_kb)
+  case ${kb:-} in
+    ''|*[!0-9]*) kb=0 ;;
+  esac
+  if [ "$kb" -gt 786432 ]; then
+    LIST_MAX_MB=32
+    LIST_MAX_ITEMS=500000
+  elif [ "$kb" -gt 196608 ]; then
+    LIST_MAX_MB=12
+    LIST_MAX_ITEMS=150000
+  else
+    LIST_MAX_MB=3
+    LIST_MAX_ITEMS=20000
+  fi
+  LIST_MAX_BYTES=$((LIST_MAX_MB * 1048576))
+}
+
 lowmem_prepare() {
   kb=$(mem_total_kb)
   [ -n "$kb" ] || return 0
@@ -756,17 +820,20 @@ lowmem_prepare() {
 make_swap() {
   f=/swapfile-vps-fengjin
   if [ -f "$f" ]; then
-    swapon "$f" 2>/dev/null || true
-    return 0
+    grep -q '/swapfile-vps-fengjin' /proc/swaps 2>/dev/null && return 0
+    swapon "$f" 2>/dev/null && return 0
+    rm -f "$f"
   fi
   if command -v fallocate >/dev/null 2>&1 && fallocate -l 64M "$f" 2>/dev/null; then
     :
   else
     dd if=/dev/zero of="$f" bs=1048576 count=64 >/dev/null 2>&1 || return 1
   fi
-  chmod 600 "$f" || return 1
-  mkswap "$f" >/dev/null 2>&1 || return 1
-  swapon "$f" || return 1
+  # 容器里常常不让开交换。失败就把文件删掉，别在小硬盘上留 64MB 垃圾。
+  if ! chmod 600 "$f" || ! mkswap "$f" >/dev/null 2>&1 || ! swapon "$f" 2>/dev/null; then
+    rm -f "$f"
+    return 1
+  fi
   if [ -f /etc/fstab ]; then
     if ! grep -q '/swapfile-vps-fengjin' /etc/fstab 2>/dev/null; then
       printf '\n/swapfile-vps-fengjin none swap sw 0 0\n' >>/etc/fstab
@@ -925,6 +992,12 @@ collect_excludes() {
   [ -n "${1:-}" ] && printf '%s\n' "$1" >>"$out"
   set -- ${SSH_CLIENT:-}
   [ -n "${1:-}" ] && printf '%s\n' "$1" >>"$out"
+  # 定时刷新没有 SSH 环境变量。把设置时的登录地址记下来，以后每次都躲开。
+  if [ -s "$out" ] && [ -d "$CFG" ]; then
+    cat "$out" "$CFG/ssh.peers" 2>/dev/null | LC_ALL=C sort -u | tail -n 20 >"$WORKDIR/ssh.peers"
+    cat "$WORKDIR/ssh.peers" >"$CFG/ssh.peers"
+  fi
+  cat "$CFG/ssh.peers" >>"$out" 2>/dev/null || true
   if [ -r /proc/net/tcp ]; then
     awk 'function h2d(h,    i, v, c, d) {
       v = 0
@@ -993,6 +1066,19 @@ apply_iptables_family() {
     "$bin" -I OUTPUT 1 -j "$CHAIN" || return 1
   fi
   return 0
+}
+
+# 拦 DNS 查询的规则也会挡住脚本自己去解析名单里的域名。
+# 刷新时先拿掉这几条，IP 规则留着；解析完 load_rules 会整套重新写上。
+pause_dns_rules() {
+  for bin in iptables ip6tables; do
+    command -v "$bin" >/dev/null 2>&1 || continue
+    # 按序号从后往前删，前面的序号不会变。
+    nums=$("$bin" -S "$CHAIN" 2>/dev/null | awk '/^-A / { n++; if (/ -m string /) print n }' | sort -rn)
+    for num in $nums; do
+      "$bin" -D "$CHAIN" "$num" 2>/dev/null || true
+    done
+  done
 }
 
 remove_iptables_family() {
@@ -1135,8 +1221,17 @@ hosts_apply() {
   cat "$WORKDIR/hosts.full" >/etc/hosts
 }
 
+# 两种情况：
+#   本来就在跑的 dnsmasq（OpenWrt 路由、别的程序装的）：只追加拦截的域名，
+#     不碰它的监听地址和上游，否则会把局域网的 DNS 弄坏。
+#   脚本自己装、自己拉起来的：记在 dnsmasq.owned，只听 127.0.0.1。
+#     关闭时连服务一起停掉，免得重启后按默认配置对外开放 53 端口。
 dnsmasq_clear() {
-  rm -f /etc/dnsmasq.d/vps-fengjin.conf
+  changed=0
+  if [ -f /etc/dnsmasq.d/vps-fengjin.conf ]; then
+    rm -f /etc/dnsmasq.d/vps-fengjin.conf
+    changed=1
+  fi
   if [ -f /etc/dnsmasq.conf ] && grep -q '# BEGIN vps-fengjin' /etc/dnsmasq.conf 2>/dev/null; then
     awk '
       $0 == "# BEGIN vps-fengjin" { s = 1; next }
@@ -1144,40 +1239,50 @@ dnsmasq_clear() {
       s != 1 { print }
     ' /etc/dnsmasq.conf >"$WORKDIR/dnsmasq.conf.new"
     cat "$WORKDIR/dnsmasq.conf.new" >/etc/dnsmasq.conf
+    changed=1
   fi
   if [ -f /etc/resolv.conf ] && grep -q 'vps-fengjin managed' /etc/resolv.conf 2>/dev/null; then
     if [ -f "$CFG/resolv.conf.bak" ]; then
       cat "$CFG/resolv.conf.bak" >/etc/resolv.conf
     fi
   fi
+  if [ -f "$CFG/dnsmasq.owned" ]; then
+    stop_dnsmasq
+    rm -f "$CFG/dnsmasq.owned"
+  elif [ "$changed" = 1 ] && pidof dnsmasq >/dev/null 2>&1; then
+    restart_dnsmasq || true
+  fi
 }
 
 write_dnsmasq_conf() {
   dest=$1
+  full=$2
   {
-    printf '%s\n' "listen-address=127.0.0.1"
-    printf '%s\n' "bind-interfaces"
-    printf '%s\n' "no-resolv"
-    printf '%s\n' "no-hosts"
-    printf '%s\n' "cache-size=50"
-    printf '%s\n' "domain-needed"
-    if [ -s "$CFG/upstream.dns" ]; then
-      while IFS= read -r ns; do
-        [ -n "$ns" ] || continue
-        printf 'server=%s\n' "$ns"
-      done <"$CFG/upstream.dns"
-    else
-      printf '%s\n' "server=1.1.1.1"
-      printf '%s\n' "server=8.8.8.8"
+    if [ "$full" = 1 ]; then
+      printf '%s\n' "listen-address=127.0.0.1"
+      printf '%s\n' "bind-interfaces"
+      printf '%s\n' "no-resolv"
+      printf '%s\n' "no-hosts"
+      printf '%s\n' "cache-size=50"
+      printf '%s\n' "domain-needed"
+      if [ -s "$CFG/upstream.dns" ]; then
+        awk 'NF { print "server=" $1 }' "$CFG/upstream.dns"
+      else
+        printf '%s\n' "server=1.1.1.1"
+        printf '%s\n' "server=8.8.8.8"
+      fi
     fi
-    if [ -s "$CFG/dns.list" ]; then
-      while IFS= read -r name; do
-        [ -n "$name" ] || continue
-        printf 'address=/%s/0.0.0.0\n' "$name"
-        printf 'address=/%s/::\n' "$name"
-      done <"$CFG/dns.list"
-    fi
+    # 名单可能有几十万行，用 awk 写，shell 逐行太慢。
+    awk 'NF { print "address=/" $1 "/0.0.0.0"; print "address=/" $1 "/::" }' "$CFG/dns.list"
   } >"$dest"
+}
+
+# dnsmasq.conf 里有没有真正生效的 conf-dir（不算注释掉的那行）。
+# Debian 系的启动脚本自己会带上 /etc/dnsmasq.d。
+dnsmasq_reads_confdir() {
+  [ -f /etc/default/dnsmasq ] && grep -q '^CONFIG_DIR=/etc/dnsmasq.d' /etc/default/dnsmasq 2>/dev/null && return 0
+  [ -f /etc/dnsmasq.conf ] && grep -E -q '^[[:space:]]*conf-dir=/etc/dnsmasq\.d' /etc/dnsmasq.conf 2>/dev/null && return 0
+  return 1
 }
 
 restart_dnsmasq() {
@@ -1196,6 +1301,20 @@ restart_dnsmasq() {
     dnsmasq && return 0
   fi
   return 1
+}
+
+stop_dnsmasq() {
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl disable --now dnsmasq >/dev/null 2>&1 || true
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service dnsmasq stop >/dev/null 2>&1 || true
+    rc-update del dnsmasq default >/dev/null 2>&1 || true
+  fi
+  if [ -x /etc/init.d/dnsmasq ]; then
+    /etc/init.d/dnsmasq stop >/dev/null 2>&1 || true
+  fi
+  killall dnsmasq 2>/dev/null || true
 }
 
 dns_query_at() {
@@ -1218,43 +1337,58 @@ dns_query_at() {
 
 dnsmasq_apply() {
   [ -s "$CFG/dns.list" ] || return 0
+  shared=0
+  if [ ! -f "$CFG/dnsmasq.owned" ] && { [ "$OS_ID" = openwrt ] || pidof dnsmasq >/dev/null 2>&1; }; then
+    shared=1
+  fi
+  if [ "$shared" = 0 ]; then
+    # resolv.conf 是链接时归 systemd-resolved 之类管，本机不会来问这个 dnsmasq，拦了等于没拦。
+    [ -L /etc/resolv.conf ] && return 1
+    if ! command -v dig >/dev/null 2>&1 && ! command -v host >/dev/null 2>&1 && ! command -v nslookup >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
   mkdir -p /etc/dnsmasq.d 2>/dev/null || true
   if [ -d /etc/dnsmasq.d ]; then
-    write_dnsmasq_conf /etc/dnsmasq.d/vps-fengjin.conf
-    if [ -f /etc/dnsmasq.conf ] && ! grep -q 'dnsmasq.d' /etc/dnsmasq.conf 2>/dev/null; then
+    # 先写好配置再装，Debian 装完会马上启动，这样一开始就只听 127.0.0.1。
+    write_dnsmasq_conf /etc/dnsmasq.d/vps-fengjin.conf "$((1 - shared))"
+  fi
+  if ! command -v dnsmasq >/dev/null 2>&1; then
+    if ! pm_install dnsmasq; then
+      dnsmasq_clear
+      return 1
+    fi
+  fi
+  if [ -d /etc/dnsmasq.d ]; then
+    if ! dnsmasq_reads_confdir; then
       printf '\n%s\n' "conf-dir=/etc/dnsmasq.d/,*.conf" >>/etc/dnsmasq.conf
     fi
   else
-    dnsmasq_clear
     {
       printf '%s\n' "# BEGIN vps-fengjin"
-      write_dnsmasq_conf "$WORKDIR/dnsmasq.body"
+      write_dnsmasq_conf "$WORKDIR/dnsmasq.body" "$((1 - shared))"
       cat "$WORKDIR/dnsmasq.body"
       printf '%s\n' "# END vps-fengjin"
     } >>/etc/dnsmasq.conf
   fi
-  owned=0
-  if [ "$OS_ID" = openwrt ] || pidof dnsmasq >/dev/null 2>&1; then
-    restart_dnsmasq || return 1
+  if [ "$shared" = 1 ]; then
+    if ! restart_dnsmasq; then
+      dnsmasq_clear
+      return 1
+    fi
     return 0
-  fi
-  if ! command -v dnsmasq >/dev/null 2>&1; then
-    pm_install dnsmasq || return 1
-  fi
-  if ! command -v dig >/dev/null 2>&1 && ! command -v host >/dev/null 2>&1 && ! command -v nslookup >/dev/null 2>&1; then
-    return 1
   fi
   if [ ! -f "$CFG/resolv.conf.bak" ] && [ -f /etc/resolv.conf ]; then
     cp /etc/resolv.conf "$CFG/resolv.conf.bak" || return 1
   fi
-  restart_dnsmasq || return 1
-  owned=1
-  if ! dns_query_at iana.org 127.0.0.1 | head -n 20 | grep -E -q '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9A-Fa-f]'; then
-    [ "$owned" = 1 ] && dnsmasq_clear
+  printf '%s\n' 1 >"$CFG/dnsmasq.owned"
+  if ! restart_dnsmasq; then
+    dnsmasq_clear
     return 1
   fi
-  if [ -L /etc/resolv.conf ]; then
-    return 0
+  if ! dns_query_at iana.org 127.0.0.1 | head -n 20 | grep -E -q '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9A-Fa-f]'; then
+    dnsmasq_clear
+    return 1
   fi
   printf '%s\n' "# vps-fengjin managed" "nameserver 127.0.0.1" >/etc/resolv.conf
   return 0
@@ -1266,6 +1400,11 @@ save_upstreams() {
   fi
   awk '/^nameserver[ \t]+/ { print $2 }' /etc/resolv.conf 2>/dev/null \
     | awk '$1 !~ /^127\./ && $1 != "::1" { print }' >"$CFG/upstream.dns" || true
+  # systemd-resolved 的 resolv.conf 只写 127.0.0.53，真正的上游在这里。
+  if [ ! -s "$CFG/upstream.dns" ] && [ -r /run/systemd/resolve/resolv.conf ]; then
+    awk '/^nameserver[ \t]+/ { print $2 }' /run/systemd/resolve/resolv.conf 2>/dev/null \
+      | awk '$1 !~ /^127\./ && $1 != "::1" { print }' >"$CFG/upstream.dns" || true
+  fi
   if [ ! -s "$CFG/upstream.dns" ]; then
     printf '%s\n' "1.1.1.1" "8.8.8.8" >"$CFG/upstream.dns"
   fi
@@ -1290,6 +1429,10 @@ run_timeout() {
   secs=$1
   out=$2
   shift 2
+  if command -v timeout >/dev/null 2>&1 && timeout 1 true >/dev/null 2>&1; then
+    timeout "$secs" "$@" >"$out" 2>/dev/null
+    return $?
+  fi
   "$@" >"$out" 2>/dev/null &
   pid=$!
   i=0
@@ -1311,12 +1454,14 @@ resolve_one() {
   srv=$2
   out=$3
   : >"$out"
+  # dig 和 host 自带超时，直接跑，不用每个名字都等上一秒。
+  # dig 默认只查 A 记录，要另外查 AAAA，不然 IPv6 地址漏封。
   if command -v dig >/dev/null 2>&1; then
-    run_timeout 4 "$out" dig +time=2 +tries=1 +short "$name" "@$srv" || true
+    dig "@$srv" +time=2 +tries=1 +short "$name" A "$name" AAAA >"$out" 2>/dev/null || true
     return 0
   fi
   if command -v host >/dev/null 2>&1; then
-    run_timeout 4 "$out" host "$name" "$srv" || true
+    host -W 2 "$name" "$srv" >"$out" 2>/dev/null || true
     return 0
   fi
   if command -v nslookup >/dev/null 2>&1; then
@@ -1408,6 +1553,7 @@ rebuild_ips() {
   failn=0
   if [ "$total" -gt 0 ] && have_resolver; then
     say_step "正在把域名解析成 IP"
+    pause_dns_rules
     while IFS= read -r name; do
       [ -n "$name" ] || continue
       n=$((n + 1))
@@ -1422,6 +1568,13 @@ rebuild_ips() {
         printf '%s\n' "$got" >>"$WORKDIR/resolved.txt"
       fi
     done <"$WORKDIR/names.txt"
+  fi
+  # 一个都没解析出来，多半是网络临时断了。沿用上次的结果，别让定时刷新把域名的 IP 全放开。
+  if [ -s "$WORKDIR/resolved.txt" ]; then
+    cp "$WORKDIR/resolved.txt" "$CFG/resolved.last"
+  elif [ "$total" -gt 0 ] && [ -s "$CFG/resolved.last" ]; then
+    say_warn "这次一个域名都没解析到，沿用上次解析到的 IP。"
+    cp "$CFG/resolved.last" "$WORKDIR/resolved.txt"
   fi
   if [ -s "$WORKDIR/resolved.txt" ]; then
     while IFS= read -r ip; do
@@ -1645,6 +1798,10 @@ remove_persistence() {
   if command -v rc-update >/dev/null 2>&1; then
     rc-update del vps-fengjin default >/dev/null 2>&1 || true
   fi
+  # OpenWrt 要先 disable，不然 /etc/rc.d 里留下指向空文件的链接。
+  if [ -f /etc/openwrt_release ] && [ -x /etc/init.d/vps-fengjin ]; then
+    /etc/init.d/vps-fengjin disable >/dev/null 2>&1 || true
+  fi
   rm -f /etc/init.d/vps-fengjin /etc/cron.d/vps-fengjin
   if [ -f /etc/crontabs/root ]; then
     grep -v 'vps-fengjin refresh' /etc/crontabs/root >"$WORKDIR/cron.root" || true
@@ -1689,8 +1846,9 @@ paste_into() {
     else
       IFS= read -r line || break
     fi
+    # 从 Windows 终端粘贴时行尾会带 \r 或空格。
     case $line in
-      END|end) break ;;
+      END|end|END[[:space:]]*|end[[:space:]]*) break ;;
     esac
     printf '%s\n' "$line" >>"$dest"
     n=$((n + 1))
@@ -1713,8 +1871,9 @@ file_into() {
     return 1
   fi
   size=$(wc -c <"$path" | awk '{ print $1 }')
-  if [ "$size" -gt 3145728 ]; then
-    say_err "文件超过 3MB，小鸡吃不消。"
+  list_limits
+  if [ "$size" -gt "$LIST_MAX_BYTES" ]; then
+    say_err "文件超过 ${LIST_MAX_MB}MB，这台机器的内存吃不消。"
     return 1
   fi
   cat "$path" >>"$dest"
@@ -1747,8 +1906,10 @@ url_into() {
     return 1
   fi
   size=$(wc -c <"$WORKDIR/download.txt" | awk '{ print $1 }')
-  if [ "$size" -gt 3145728 ]; then
-    say_err "下载内容超过 3MB。"
+  list_limits
+  if [ "$size" -gt "$LIST_MAX_BYTES" ]; then
+    say_err "下载内容超过 ${LIST_MAX_MB}MB，这台机器的内存吃不消。"
+    rm -f "$WORKDIR/download.txt"
     return 1
   fi
   sig=$(dd if="$WORKDIR/download.txt" bs=80 count=1 2>/dev/null | tr 'A-Z' 'a-z')
@@ -1804,7 +1965,19 @@ classify_raw() {
   awk -F '\t' '$1 != "bad" { print }' "$WORKDIR/class.all" | LC_ALL=C sort -u >"$out"
   cat "$WORKDIR/class.bad" >>"$WORKDIR/class.preview"
   cp "$out" "$WORKDIR/class.good"
-  cat "$WORKDIR/class.bad" >>"$WORKDIR/class.preview"
+}
+
+cap_list() {
+  list=$1
+  list_limits
+  n=$(wc -l <"$list" | awk '{ print $1 }')
+  if [ "${n:-0}" -gt "$LIST_MAX_ITEMS" ]; then
+    say_warn "超过 $LIST_MAX_ITEMS 条，这台机器只保留前 $LIST_MAX_ITEMS 条。"
+    # IP 和网段排在前面，先保住它们。
+    awk -F '\t' '$1 != "domain" && $1 != "suffix"' "$list" >"$WORKDIR/list.cap"
+    awk -F '\t' '$1 == "domain" || $1 == "suffix"' "$list" >>"$WORKDIR/list.cap"
+    head -n "$LIST_MAX_ITEMS" "$WORKDIR/list.cap" >"$list"
+  fi
 }
 
 collect_sources() {
@@ -2021,15 +2194,12 @@ wizard() {
     die "名单里没有能用的域名或 IP。"
   fi
   say_ok "可用：域名 $N_DOMAIN 个，整段后缀 $N_SUFFIX 个，IP / 网段 $N_IP 个"
-  if [ "$goodn" -gt 20000 ]; then
-    say_warn "超过 20000 条，只保留前 20000 条。"
-    head -n 20000 "$WORKDIR/good.txt" >"$WORKDIR/good.cap"
-    cat "$WORKDIR/good.cap" >"$WORKDIR/good.txt"
-  fi
+  cap_list "$WORKDIR/good.txt"
   ask_scope
   confirm_apply
   mkdir -p "$CFG"
   cat "$WORKDIR/good.txt" >"$CFG/list.txt"
+  rm -f "$CFG/resolved.last"
   printf '%s\n' "$MODE" >"$CFG/mode"
   printf '%s\n' "$PORTS" >"$CFG/ports"
   activate
@@ -2042,24 +2212,22 @@ append_wizard() {
   summarize_list "$WORKDIR/class.all"
   show_bads "$WORKDIR/class.all"
   cat "$CFG/list.txt" "$WORKDIR/good.txt" | LC_ALL=C sort -u >"$WORKDIR/merged.txt"
-  cat "$WORKDIR/merged.txt" >"$CFG/list.txt"
-  say_ok "名单已追加。"
+  cap_list "$WORKDIR/merged.txt"
+  MODE=$(cat "$CFG/mode")
+  PORTS=$(cat "$CFG/ports" 2>/dev/null || true)
   if ! ans=$(ask_line "沿用现在的封禁范围？回车沿用，输入 n 重选："); then
     die "读不到键盘输入。"
   fi
   case $ans in
-    n|N)
-      ask_scope
-      printf '%s\n' "$MODE" >"$CFG/mode"
-      printf '%s\n' "$PORTS" >"$CFG/ports"
-      ;;
+    n|N) ask_scope ;;
   esac
-  N_DOMAIN=$(awk -F '\t' '$1 == "domain" { c++ } END { print c + 0 }' "$CFG/list.txt")
-  N_SUFFIX=$(awk -F '\t' '$1 == "suffix" { c++ } END { print c + 0 }' "$CFG/list.txt")
-  N_IP=$(awk -F '\t' '$1 == "ip4" || $1 == "net4" || $1 == "ip6" || $1 == "net6" { c++ } END { print c + 0 }' "$CFG/list.txt")
-  MODE=$(cat "$CFG/mode")
-  PORTS=$(cat "$CFG/ports" 2>/dev/null || true)
+  summarize_list "$WORKDIR/merged.txt"
+  # 确认之后才写回去。取消时名单和范围都保持原样。
   confirm_apply
+  cat "$WORKDIR/merged.txt" >"$CFG/list.txt"
+  printf '%s\n' "$MODE" >"$CFG/mode"
+  printf '%s\n' "$PORTS" >"$CFG/ports"
+  say_ok "名单已追加。"
   activate
 }
 
@@ -2139,22 +2307,7 @@ menu() {
           y|Y|yes|YES|是) ;;
           *) say_info "已取消。"; return 0 ;;
         esac
-        printf '%s\n' 0 >"$CFG/enabled"
-        remove_firewall
-        hosts_clear
-        dnsmasq_clear
-        remove_persistence
-        if [ -f /swapfile-vps-fengjin ]; then
-          swapoff /swapfile-vps-fengjin 2>/dev/null || true
-          rm -f /swapfile-vps-fengjin
-          if [ -f /etc/fstab ]; then
-            grep -v '/swapfile-vps-fengjin' /etc/fstab >"$WORKDIR/fstab.new" || true
-            cat "$WORKDIR/fstab.new" >/etc/fstab
-          fi
-        fi
-        rm -rf "$CFG"
-        rm -f "$BIN_DEFAULT" /usr/sbin/vps-fengjin
-        say_ok "已彻底删除。"
+        cmd_purge
         return 0
         ;;
       0) return 0 ;;
@@ -2229,6 +2382,25 @@ cmd_off() {
   say_ok "已关闭。名单还在。"
 }
 
+cmd_purge() {
+  # dnsmasq_clear 要读 $CFG 里的记录，必须在删目录之前。
+  remove_firewall
+  hosts_clear
+  dnsmasq_clear
+  remove_persistence
+  if [ -f /swapfile-vps-fengjin ]; then
+    swapoff /swapfile-vps-fengjin 2>/dev/null || true
+    rm -f /swapfile-vps-fengjin
+    if [ -f /etc/fstab ]; then
+      grep -v '/swapfile-vps-fengjin' /etc/fstab >"$WORKDIR/fstab.new" || true
+      cat "$WORKDIR/fstab.new" >/etc/fstab
+    fi
+  fi
+  rm -rf "$CFG"
+  rm -f "$BIN_DEFAULT" /usr/sbin/vps-fengjin
+  say_ok "已彻底删除。"
+}
+
 cmd_refresh() {
   [ -f "$CFG/list.txt" ] || die "还没有名单。"
   en=$(cat "$CFG/enabled" 2>/dev/null || echo 0)
@@ -2299,23 +2471,8 @@ main() {
       if ! take_lock; then
         die "另一个封禁任务正在跑。"
       fi
-      # 复用菜单里的删除需要确认。命令行直接删。
-      printf '%s\n' 0 >"$CFG/enabled"
-      remove_firewall
-      hosts_clear
-      dnsmasq_clear
-      remove_persistence
-      if [ -f /swapfile-vps-fengjin ]; then
-        swapoff /swapfile-vps-fengjin 2>/dev/null || true
-        rm -f /swapfile-vps-fengjin
-        if [ -f /etc/fstab ]; then
-          grep -v '/swapfile-vps-fengjin' /etc/fstab >"$WORKDIR/fstab.new" || true
-          cat "$WORKDIR/fstab.new" >/etc/fstab
-        fi
-      fi
-      rm -rf "$CFG"
-      rm -f "$BIN_DEFAULT" /usr/sbin/vps-fengjin
-      say_ok "已彻底删除。"
+      # 菜单里的删除要再确认一次。命令行直接删。
+      cmd_purge
       exit 0
       ;;
     "")
