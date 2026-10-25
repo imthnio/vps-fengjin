@@ -16,7 +16,7 @@
 #   sh install.sh check 文件  只检查名单，不改防火墙
 #======================================================================
 
-VERSION=1.1.0
+VERSION=1.1.1
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -300,6 +300,10 @@ function emit_name(kind, host) {
   if (substr(host, 1, 2) == "*.") {
     kind = "suffix"
     host = substr(host, 3)
+  } else if (substr(host, 1, 2) == "+.") {
+    # Clash 域名集合的写法，+.example.com 表示本域名和所有子域名。
+    kind = "suffix"
+    host = substr(host, 3)
   } else if (substr(host, 1, 1) == ".") {
     kind = "suffix"
     host = substr(host, 2)
@@ -390,12 +394,25 @@ function emit_addr_or_name(s,   n, f, i, host) {
   emit_name("domain", s)
 }
 function do_classify(   s, f, n, kind, host) {
-  s = trim($0)
+  s = $0
+  # 文件开头可能带 UTF-8 的 BOM（看不见的标记），会让第一行认不出来。
+  sub(/^\357\273\277/, "", s)
+  s = trim(s)
   if (s == "" || substr(s, 1, 1) == "#" || substr(s, 1, 1) == "!") return
   if (substr(s, 1, 2) == "@@") return
   sub(/[ \t]+#.*/, "", s)
   s = trim(s)
   if (s == "") return
+  # Clash 的 YAML 名单：第一行 payload:，后面每行形如  - '"'"'DOMAIN,example.com'"'"'
+  if (s ~ /^payload:[ \t]*$/) return
+  if (s ~ /^-[ \t]+/) {
+    sub(/^-[ \t]+/, "", s)
+    s = trim(s)
+  }
+  if (length(s) >= 2 && s ~ /^[\047"].*[\047"]$/) s = trim(substr(s, 2, length(s) - 2))
+  if (s == "") return
+  # 全角逗号写成的规则，例如 DOMAIN，example.com
+  if (s ~ /^[A-Za-z0-9_-]+[ \t]*，/) gsub(/[ \t]*，[ \t]*/, ",", s)
   if (s ~ /^address=\//) {
     n = split(s, f, "/")
     emit_name("suffix", f[2])
