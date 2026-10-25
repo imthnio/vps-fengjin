@@ -16,7 +16,7 @@
 #   sh install.sh check 文件  只检查名单，不改防火墙
 #======================================================================
 
-VERSION=1.1.2
+VERSION=1.1.3
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -65,6 +65,7 @@ fengjin_awk() {
   _rtcp=${9:-reset}
   _roth=${10:-reject}
   _ipset=${11:-1}
+  _nocap=${12:-1500}
   LC_ALL=C awk \
     -v mode="$_mode" \
     -v peers="$_peers" \
@@ -76,7 +77,8 @@ fengjin_awk() {
     -v algo="$_algo" \
     -v reject_tcp="$_rtcp" \
     -v reject_other="$_roth" \
-    -v have_ipset="$_ipset" '
+    -v have_ipset="$_ipset" \
+    -v nocap="$_nocap" '
 function trim(s) {
   sub(/\r$/, "", s)
   gsub(/^[ \t]+/, "", s)
@@ -615,8 +617,8 @@ function render_rules(   mode_s, ports_s, method, list, setname, mspec, addr, li
     while ((getline addr < list) > 0) {
       if (addr == "") continue
       c++
-      if (c > 1500) {
-        print "ipset 不可用，只写入前 1500 条地址" > "/dev/stderr"
+      if (c > nocap) {
+        print "ipset 不可用，规则条数有上限，只写入前 " nocap "条地址，超出的不拦" > "/dev/stderr"
         break
       }
       mspec = "-d " addr
@@ -1012,7 +1014,7 @@ ensure_firewall() {
     if [ "$HAVE_IPSET" = 1 ]; then
       say_ok "防火墙：iptables + ipset"
     else
-      say_warn "有 iptables，但 ipset 不能用。地址一多会慢，最多写 1500 条。"
+      say_warn "有 iptables，但 ipset 不能用（常见于部分 NAT 小鸡，内核模块被限制）。地址一多规则会变多变慢，这不是不让用整机模式，只是最多写 $(no_ipset_rule_cap) 条地址，域名或 IP 数量超出时，超出部分不拦。"
     fi
   else
     say_ok "防火墙：nftables"
@@ -1154,6 +1156,23 @@ ipv6_on() {
   return 0
 }
 
+# 没有 ipset 时，域名解析出的 IP 得一条一条写进 iptables 规则，条数一多
+# 规则表变长、匹配变慢。按内存给一个上限：内存越大能扛的规则条数越多。
+# 这不是整机模式专属的限制，按端口封禁一样受这个上限。
+no_ipset_rule_cap() {
+  kb=$(mem_total_kb)
+  case ${kb:-} in
+    ''|*[!0-9]*) printf '%s\n' 1500; return 0 ;;
+  esac
+  if [ "$kb" -le 131072 ]; then
+    printf '%s\n' 1500
+  elif [ "$kb" -le 524288 ]; then
+    printf '%s\n' 4000
+  else
+    printf '%s\n' 8000
+  fi
+}
+
 load_rules() {
   [ -f "$CFG/enabled" ] || return 0
   en=$(cat "$CFG/enabled" 2>/dev/null || echo 0)
@@ -1188,10 +1207,10 @@ load_rules() {
         load_ipset_file "$WORKDIR/set6.txt" || die "IPv6 地址集没有写进去。"
       fi
     fi
-    fengjin_awk rules "" "" "" "$CFG" 4 "$HAVE_MULTIPORT" "$algo" "$REJECT_TCP" "$REJECT_OTHER" "$HAVE_IPSET" >"$WORKDIR/r4.txt"
+    fengjin_awk rules "" "" "" "$CFG" 4 "$HAVE_MULTIPORT" "$algo" "$REJECT_TCP" "$REJECT_OTHER" "$HAVE_IPSET" "$(no_ipset_rule_cap)" >"$WORKDIR/r4.txt"
     apply_iptables_family 4 "$WORKDIR/r4.txt" || return 1
     if [ "$do6" = 1 ]; then
-      fengjin_awk rules "" "" "" "$CFG" 6 "$HAVE_MULTIPORT" "$algo" "$REJECT_TCP" "$REJECT_OTHER" "$HAVE_IPSET" >"$WORKDIR/r6.txt"
+      fengjin_awk rules "" "" "" "$CFG" 6 "$HAVE_MULTIPORT" "$algo" "$REJECT_TCP" "$REJECT_OTHER" "$HAVE_IPSET" "$(no_ipset_rule_cap)" >"$WORKDIR/r6.txt"
       apply_iptables_family 6 "$WORKDIR/r6.txt" || return 1
     fi
   else
@@ -1509,6 +1528,37 @@ resolve_one() {
   fi
 }
 
+# 同时解析多个域名的并发数。内存小的机器少开几个，免得几十个 dig
+# 子进程一起占内存、占带宽把小鸡挤爆；内存大的机器多开一点，解析更快。
+resolve_concurrency() {
+  kb=$(mem_total_kb)
+  case ${kb:-} in
+    ''|*[!0-9]*) printf '%s\n' 10; return 0 ;;
+  esac
+  if [ "$kb" -le 131072 ]; then
+    printf '%s\n' 20
+  elif [ "$kb" -le 524288 ]; then
+    printf '%s\n' 40
+  else
+    printf '%s\n' 80
+  fi
+}
+
+# 一批域名并发解析：每个域名起一个后台 dig/host/nslookup，各写各的临时文件，
+# 全部起完后统一 wait，再按顺序收结果。比一个个排队查快得多，几万个域名也能跑完。
+resolve_batch() {
+  batch_file=$1
+  srv=$2
+  outdir=$3
+  i=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    i=$((i + 1))
+    resolve_one "$name" "$srv" "$outdir/$i.out" &
+  done <"$batch_file"
+  wait
+}
+
 first_upstream() {
   if [ -s "$CFG/upstream.dns" ]; then
     awk 'NF { print; exit }' "$CFG/upstream.dns"
@@ -1550,13 +1600,12 @@ rebuild_ips() {
   : >"$WORKDIR/v4.raw"
   : >"$WORKDIR/v6.raw"
   : >"$WORKDIR/names.txt"
-  # 最多只解析 2000 个名字。写的时候就截住，免得几十万行先排一遍序，小鸡内存吃不消。
-  awk -F '\t' -v cap=2000 -v w="$WORKDIR" '
+  # 收集所有要解析的名字。名单本身的条数上限按内存分级（见 list_limits），
+  # 这里不再额外截断，名单里有多少域名就解析多少个。
+  awk -F '\t' -v w="$WORKDIR" '
     function name(s) {
-      if (c >= cap) { more++; return }
       if (s in seen) return
       seen[s] = 1
-      c++
       print s >> (w "/names.txt")
     }
     $1 == "ip4" || $1 == "net4" { print $2 >> (w "/v4.raw") }
@@ -1566,7 +1615,6 @@ rebuild_ips() {
       name($2)
       if ($2 !~ /^www\./) name("www." $2)
     }
-    END { print c + more > (w "/names.count") }
   ' "$CFG/list.txt"
   if [ -s "$WORKDIR/names.txt" ]; then
     LC_ALL=C sort -u "$WORKDIR/names.txt" -o "$WORKDIR/names.txt"
@@ -1588,28 +1636,52 @@ rebuild_ips() {
   : >"$WORKDIR/resolved.txt"
   total=$(wc -l <"$WORKDIR/names.txt" | awk '{ print $1 }')
   [ -n "$total" ] || total=0
-  if [ "$(cat "$WORKDIR/names.count" 2>/dev/null || echo 0)" -gt 2000 ]; then
-    say_warn "域名超过 2000 个，只解析前 2000 个的 IP。"
-  fi
   n=0
   failn=0
   if [ "$total" -gt 0 ] && have_resolver; then
-    say_step "正在把域名解析成 IP"
+    conc=$(resolve_concurrency)
+    say_step "正在把域名解析成 IP（并发 $conc 个，共 $total 个，会分批进行）"
     pause_dns_rules
+    mkdir -p "$WORKDIR/resout"
+    : >"$WORKDIR/batch.txt"
+    bn=0
     while IFS= read -r name; do
       [ -n "$name" ] || continue
-      n=$((n + 1))
-      if [ $((n % 20)) -eq 0 ]; then
+      printf '%s\n' "$name" >>"$WORKDIR/batch.txt"
+      bn=$((bn + 1))
+      if [ "$bn" -ge "$conc" ]; then
+        resolve_batch "$WORKDIR/batch.txt" "$srv" "$WORKDIR/resout"
+        for f in "$WORKDIR/resout"/*.out; do
+          [ -f "$f" ] || continue
+          got=$(fengjin_awk extract "" "$srv" <"$f" || true)
+          if [ -z "$got" ]; then
+            failn=$((failn + 1))
+          else
+            printf '%s\n' "$got" >>"$WORKDIR/resolved.txt"
+          fi
+        done
+        rm -f "$WORKDIR/resout"/*.out
+        n=$((n + bn))
         say_info "已解析 $n / $total"
-      fi
-      resolve_one "$name" "$srv" "$WORKDIR/one.txt"
-      got=$(fengjin_awk extract "" "$srv" <"$WORKDIR/one.txt" || true)
-      if [ -z "$got" ]; then
-        failn=$((failn + 1))
-      else
-        printf '%s\n' "$got" >>"$WORKDIR/resolved.txt"
+        : >"$WORKDIR/batch.txt"
+        bn=0
       fi
     done <"$WORKDIR/names.txt"
+    if [ "$bn" -gt 0 ]; then
+      resolve_batch "$WORKDIR/batch.txt" "$srv" "$WORKDIR/resout"
+      for f in "$WORKDIR/resout"/*.out; do
+        [ -f "$f" ] || continue
+        got=$(fengjin_awk extract "" "$srv" <"$f" || true)
+        if [ -z "$got" ]; then
+          failn=$((failn + 1))
+        else
+          printf '%s\n' "$got" >>"$WORKDIR/resolved.txt"
+        fi
+      done
+      n=$((n + bn))
+      say_info "已解析 $n / $total"
+    fi
+    rm -rf "$WORKDIR/resout"
   fi
   # 一个都没解析出来，多半是网络临时断了。沿用上次的结果，别让定时刷新把域名的 IP 全放开。
   if [ -s "$WORKDIR/resolved.txt" ]; then
