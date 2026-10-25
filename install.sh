@@ -16,7 +16,7 @@
 #   sh install.sh check 文件  只检查名单，不改防火墙
 #======================================================================
 
-VERSION=1.1.1
+VERSION=1.1.2
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -2114,9 +2114,9 @@ add_source() {
   printf '%s %s %s\n' "$N_DOMAIN" "$N_SUFFIX" "$N_IP" >"$d/count"
   printf '%s\n' "$kind" >"$d/kind"
   printf '%s\n' "$origin" >"$d/origin"
-  name=$(ask_line "给这份名单起个备注名，直接回车用「$defname」：") || name=""
-  name=$(clean_name "$name")
-  [ -n "$name" ] || name=$defname
+  # 不在这里追问备注名，免得打断“加完名单就问封禁范围”的节奏。
+  # 想改名字，去“查看已添加的名单”里改。
+  name=$defname
   printf '%s\n' "$name" >"$d/name"
   say_ok "已添加「$name」：域名 $((N_DOMAIN + N_SUFFIX)) 个，IP / 网段 $N_IP 个"
 }
@@ -2259,6 +2259,7 @@ commit_sources() {
 ask_scope() {
   while :; do
     tty_say ""
+    tty_say "===================="
     tty_say "封在什么范围？这里的端口是对方网站的端口，不是这台机器对外开的端口。"
     tty_say "  1) 只封一个目标端口。例如只拦 443，别的端口还能连这些地址"
     tty_say "  2) 封多个目标端口。例如 80 和 443"
