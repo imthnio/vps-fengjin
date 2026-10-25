@@ -33,9 +33,14 @@ example.com
 1.2.3.0/24
 DOMAIN-SUFFIX,example.com
 IP-CIDR,1.2.3.0/24
+IP-CIDR6,2001:db8::/32,no-resolve
++.example.com
+- 'DOMAIN-SUFFIX,example.com'
 0.0.0.0 example.com
 ||example.com^
 ```
+
+Clash 的 YAML 名单（以 `payload:` 开头、每行前面有 `- `，带不带引号都行）也能直接用。文件开头的隐藏标记（BOM）和 Windows 换行会自动忽略。
 
 `/16` 比这更宽的 IPv4 网段，以及 `/32` 比这更宽的 IPv6 网段，会跳过。这样一份写错的名单不会把整台机器的出口封死。你当前 SSH 的来源地址、本机地址也会跳过。
 

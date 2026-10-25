@@ -54,6 +54,13 @@ eq "ip as suffix" "$(classify 'DOMAIN-SUFFIX,103.21.91.144')" "ip4	103.21.91.144
 eq "ip6 as domain" "$(classify 'DOMAIN,2001:db8::7')" "ip6	2001:db8::7"
 eq "numeric label ok" "$(classify '1.2.3.example.com')" "domain	1.2.3.example.com"
 eq "hosts localhost" "$(classify '127.0.0.1 localhost')" "bad	parse	localhost"
+eq "user sample" "$(printf '%s\n' 'DOMAIN,123.4456.com,' 'DOMAIN-SUFFIX,123.com' 'IP-CIDR,1.211.111.0/22,no-resolve' 'IP-CIDR6,2a01:1110:f000::/36,no-resolve' | fengjin_awk classify)" "$(printf '%s\n' 'domain	123.4456.com' 'suffix	123.com' 'net4	1.211.108.0/22' 'net6	2a01:1110:f000::/36')"
+eq "bom first line" "$(printf '\357\273\277DOMAIN,example.com\n' | fengjin_awk classify)" "domain	example.com"
+eq "crlf" "$(printf 'DOMAIN-SUFFIX,example.com\r\n' | fengjin_awk classify)" "suffix	example.com"
+eq "yaml payload" "$(printf '%s\n' 'payload:' "  - 'DOMAIN-SUFFIX,example.com'" '  - "IP-CIDR,10.1.2.0/24,no-resolve"' '  - DOMAIN,www.example.org' | fengjin_awk classify)" "$(printf '%s\n' 'suffix	example.com' 'net4	10.1.2.0/24' 'domain	www.example.org')"
+eq "yaml plain cidr" "$(printf '%s\n' "- '1.0.1.0/24'" | fengjin_awk classify)" "net4	1.0.1.0/24"
+eq "fullwidth comma" "$(printf '%s\n' 'DOMAIN，example.com' | fengjin_awk classify)" "domain	example.com"
+eq "plus dot" "$(printf '%s\n' '+.Example.com' | fengjin_awk classify)" "suffix	example.com"
 eq "wire" "$(printf '%s\n' example.com | fengjin_awk wire)" "076578616d706c6503636f6d"
 
 got=$(parse_ports "80, 443")
