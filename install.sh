@@ -16,7 +16,7 @@
 #   sh install.sh check 文件  只检查名单，不改防火墙
 #======================================================================
 
-VERSION=1.0.0
+VERSION=1.1.0
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -303,6 +303,11 @@ function emit_name(kind, host) {
   } else if (substr(host, 1, 1) == ".") {
     kind = "suffix"
     host = substr(host, 2)
+  }
+  # 有的名单把 IP 写在域名位置，例如 DOMAIN-SUFFIX,1.2.3.4。按 IP 封。
+  if (is_ipv4(host) || is_ipv6(host)) {
+    emit_addr(host)
+    return
   }
   if (!is_domain(host)) {
     bad("parse", host)
@@ -1845,7 +1850,7 @@ ask_line() {
     printf '%s' "$prompt"
     IFS= read -r ans || return 1
   fi
-  printf '%s\n' "$ans" | sed 's/^[ \t]*//;s/[ \t]*$//'
+  printf '%s\n' "$ans" | sed 's/^[[:blank:]]*//;s/[[:blank:]]*$//'
 }
 
 tty_say() {
@@ -1878,14 +1883,12 @@ paste_into() {
     fi
   done
   say_ok "这次收到 $n 行"
+  [ "$n" -gt 0 ]
 }
 
 file_into() {
   dest=$1
-  if ! path=$(ask_line "文件路径："); then
-    return 1
-  fi
-  path=$(printf '%s' "$path" | sed 's/^"//;s/"$//;s/^'"'"'//;s/'"'"'$//')
+  path=$2
   if [ ! -f "$path" ]; then
     say_err "找不到这个文件。"
     return 1
@@ -1914,15 +1917,9 @@ fetch_url() {
 
 url_into() {
   dest=$1
-  if ! url=$(ask_line "名单网址："); then
-    return 1
-  fi
-  case $url in
-    http://*|https://*) ;;
-    *) say_err "只接受 http 或 https 网址。"; return 1 ;;
-  esac
+  url=$2
   if ! fetch_url "$url" "$WORKDIR/download.txt"; then
-    say_err "下载失败。"
+    say_err "下载失败。请检查网址拼写，以及这台机器能不能连上那个网站。"
     return 1
   fi
   size=$(wc -c <"$WORKDIR/download.txt" | awk '{ print $1 }')
@@ -2019,33 +2016,226 @@ cap_list() {
   fi
 }
 
+#----------------------------------------------------------------------
+# 每份名单单独存一份，带备注名，方便以后查看和改名。
+#   $CFG/sources/<编号>/      已经生效的名单
+#   $WORKDIR/sources/<编号>/  这次新加、还没确认的名单
+# 每个目录里：name 备注名，kind 来源（url / file / paste / old），
+#   origin 网址或文件路径，count 「域名 后缀 IP」个数，list 解析后的名单。
+#----------------------------------------------------------------------
+
+clean_name() {
+  printf '%s' "$1" | tr -d '\000-\037' | sed 's/^[[:blank:]]*//;s/[[:blank:]]*$//'
+}
+
+# 列出名单目录。new：只有这次新加的；append：已有的加上这次新加的；saved：只有已有的。
+source_dirs() {
+  if [ "$1" != new ] && [ -d "$CFG/sources" ]; then
+    ls "$CFG/sources" | LC_ALL=C sort -n | sed "s|^|$CFG/sources/|"
+  fi
+  if [ "$1" != saved ] && [ -d "${PENDING:-}" ]; then
+    ls "$PENDING" | LC_ALL=C sort -n | sed "s|^|$PENDING/|"
+  fi
+}
+
+next_source_id() {
+  { ls "$CFG/sources" 2>/dev/null; ls "${PENDING:-/nonexistent}" 2>/dev/null; } \
+    | awk '$1 ~ /^[0-9]+$/ && $1 > m { m = $1 } END { print m + 1 }'
+}
+
+show_source_line() {
+  i=$1
+  d=$2
+  name=$(cat "$d/name" 2>/dev/null)
+  kind=$(cat "$d/kind" 2>/dev/null)
+  origin=$(cat "$d/origin" 2>/dev/null)
+  set -- $(cat "$d/count" 2>/dev/null) 0 0 0
+  case $kind in
+    url) from="网址 $origin" ;;
+    file) from="文件 $origin" ;;
+    paste) from="粘贴" ;;
+    *) from="升级前的名单" ;;
+  esac
+  tag=""
+  case $d in
+    "${PENDING:-/nonexistent}"/*) tag="（本次新加）" ;;
+  esac
+  printf '  %s) %s%s\n' "$i" "$name" "$tag"
+  printf '     %s；域名 %s 个，IP / 网段 %s 个\n' "$from" "$(($1 + $2))" "$3"
+}
+
+# 升级前只有一份合并好的 list.txt，把它当成一份名单。
+migrate_sources() {
+  [ -d "$CFG/sources" ] && return 0
+  [ -s "$CFG/list.txt" ] || return 0
+  mkdir -p "$CFG/sources/1"
+  cp "$CFG/list.txt" "$CFG/sources/1/list"
+  summarize_list "$CFG/list.txt"
+  printf '%s %s %s\n' "$N_DOMAIN" "$N_SUFFIX" "$N_IP" >"$CFG/sources/1/count"
+  printf '%s\n' "原有名单" >"$CFG/sources/1/name"
+  printf '%s\n' old >"$CFG/sources/1/kind"
+  : >"$CFG/sources/1/origin"
+}
+
+add_source() {
+  kind=$1
+  origin=$2
+  defname=$3
+  raw=$4
+  id=$(next_source_id)
+  d=$PENDING/$id
+  mkdir -p "$d"
+  classify_raw "$raw" "$d/list"
+  summarize_list "$WORKDIR/class.all"
+  show_bads "$WORKDIR/class.all"
+  summarize_list "$d/list"
+  if [ $((N_DOMAIN + N_SUFFIX + N_IP)) -eq 0 ]; then
+    say_err "这份名单里没有能用的域名或 IP，没有加进去。"
+    rm -rf "$d"
+    return 1
+  fi
+  printf '%s %s %s\n' "$N_DOMAIN" "$N_SUFFIX" "$N_IP" >"$d/count"
+  printf '%s\n' "$kind" >"$d/kind"
+  printf '%s\n' "$origin" >"$d/origin"
+  name=$(ask_line "给这份名单起个备注名，直接回车用「$defname」：") || name=""
+  name=$(clean_name "$name")
+  [ -n "$name" ] || name=$defname
+  printf '%s\n' "$name" >"$d/name"
+  say_ok "已添加「$name」：域名 $((N_DOMAIN + N_SUFFIX)) 个，IP / 网段 $N_IP 个"
+}
+
+view_sources() {
+  smode=$1
+  while :; do
+    source_dirs "$smode" >"$WORKDIR/src.idx"
+    tty_say ""
+    if [ "$smode" = new ] && [ -d "$CFG/sources" ]; then
+      tty_say "这次是换一套新名单，原来的名单确认后会被替换，这里不列出。"
+    fi
+    if [ ! -s "$WORKDIR/src.idx" ]; then
+      say_info "还没有添加任何名单。"
+      return 0
+    fi
+    tty_say "已添加的名单："
+    i=0
+    while IFS= read -r d; do
+      i=$((i + 1))
+      show_source_line "$i" "$d"
+    done <"$WORKDIR/src.idx"
+    if ! ans=$(ask_line "输入编号修改备注名，直接回车返回："); then
+      return 0
+    fi
+    [ -n "$ans" ] || return 0
+    d=""
+    case $ans in
+      *[!0-9]*) ;;
+      *) d=$(sed -n "${ans}p" "$WORKDIR/src.idx" 2>/dev/null) ;;
+    esac
+    if [ -z "$d" ]; then
+      say_warn "没有这个编号。"
+      continue
+    fi
+    old=$(cat "$d/name" 2>/dev/null)
+    if ! new=$(ask_line "新的备注名（现在是「$old」）："); then
+      return 0
+    fi
+    new=$(clean_name "$new")
+    if [ -z "$new" ]; then
+      say_info "没有改。"
+      continue
+    fi
+    printf '%s\n' "$new" >"$d/name"
+    say_ok "已改为「$new」"
+    # 已经生效的名单马上写回状态，不用等下次生效。
+    case $d in
+      "$CFG"/*) [ -f "$CFG/mode" ] && write_status ;;
+    esac
+  done
+}
+
+# 返回 1 表示这次一份新名单都没加（追加时只是看看、改改名）。
 collect_sources() {
-  dest=$1
-  : >"$dest"
+  smode=$1
+  PENDING=$WORKDIR/sources
+  rm -rf "$PENDING"
+  mkdir -p "$PENDING"
   while :; do
     tty_say ""
     tty_say "名单怎么添加？"
     tty_say "  1) 粘贴。一行一个，最后一行输入 END"
-    tty_say "  2) 这台机器上已经有的文件"
-    tty_say "  3) 名单网址"
+    tty_say "  2) 查看已添加的名单，修改备注名"
+    tty_say "  3) 名单网址，或这台机器上的文件路径"
     tty_say "  0) 添加完了，下一步"
     if ! choice=$(ask_line "请选择 [0]: "); then
       die "读不到键盘输入。"
     fi
     [ -n "$choice" ] || choice=0
+    raw=$WORKDIR/raw.txt
     case $choice in
-      1) paste_into "$dest" || true ;;
-      2) file_into "$dest" || true ;;
-      3) url_into "$dest" || true ;;
-      0)
-        if [ ! -s "$dest" ]; then
-          say_warn "还没有名单。"
-          continue
+      1)
+        : >"$raw"
+        if paste_into "$raw"; then
+          add_source paste "" "粘贴的名单 $(next_source_id)" "$raw" || true
         fi
-        return 0
+        ;;
+      2) view_sources "$smode" ;;
+      3)
+        if ! src=$(ask_line "名单网址或文件路径："); then
+          die "读不到键盘输入。"
+        fi
+        src=$(printf '%s' "$src" | sed 's/^"//;s/"$//;s/^'"'"'//;s/'"'"'$//')
+        : >"$raw"
+        case $src in
+          '') ;;
+          http://*|https://*)
+            if url_into "$raw" "$src"; then
+              # 默认备注名用网址最后一段，例如 AntiAD.list。
+              def=$(printf '%s' "$src" | sed 's/[?#].*//;s|/*$||;s|.*/||')
+              add_source url "$src" "${def:-网址名单}" "$raw" || true
+            fi
+            ;;
+          *://*) say_err "只接受 http 或 https 网址。" ;;
+          *)
+            case $src in
+              "~/"*) src=$HOME/${src#"~/"} ;;
+            esac
+            if file_into "$raw" "$src"; then
+              add_source file "$src" "$(basename "$src")" "$raw" || true
+            fi
+            ;;
+        esac
+        ;;
+      0)
+        if [ -n "$(ls "$PENDING")" ]; then
+          return 0
+        fi
+        if [ "$smode" = append ]; then
+          return 1
+        fi
+        say_warn "还没有名单。"
         ;;
       *) say_warn "请输入 1、2、3 或 0。" ;;
     esac
+  done
+}
+
+merge_sources() {
+  smode=$1
+  out=$2
+  source_dirs "$smode" | while IFS= read -r d; do
+    cat "$d/list"
+  done | LC_ALL=C sort -u >"$out"
+  cap_list "$out"
+}
+
+commit_sources() {
+  smode=$1
+  [ "$smode" = new ] && rm -rf "$CFG/sources"
+  mkdir -p "$CFG/sources"
+  for d in "$PENDING"/*; do
+    [ -d "$d" ] || continue
+    rm -rf "$CFG/sources/${d##*/}"
+    mv "$d" "$CFG/sources/"
   done
 }
 
@@ -2160,6 +2350,14 @@ write_status() {
       printf '范围：目标端口 %s\n' "$ports"
     fi
     printf '名单：域名 %s 个，整段后缀 %s 个，IP / 网段 %s 个\n' "$nd" "$ns" "$ni"
+    source_dirs saved >"$WORKDIR/status.idx" 2>/dev/null || true
+    if [ -s "$WORKDIR/status.idx" ]; then
+      j=0
+      while IFS= read -r sd; do
+        j=$((j + 1))
+        show_source_line "$j" "$sd"
+      done <"$WORKDIR/status.idx"
+    fi
     printf '实际封住的地址：IPv4 %s 条，IPv6 %s 条\n' "$nv4" "$nv6"
     case $method in
       string) printf '%s\n' "域名拦截：拦发往 53 端口的域名查询，不改本机 DNS 设置" ;;
@@ -2220,21 +2418,14 @@ activate() {
 }
 
 wizard() {
-  raw=$WORKDIR/raw.txt
-  collect_sources "$raw"
-  classify_raw "$raw" "$WORKDIR/good.txt"
+  collect_sources new
+  merge_sources new "$WORKDIR/good.txt"
   summarize_list "$WORKDIR/good.txt"
-  N_BAD=$(awk -F '\t' '$1 == "bad" { c++ } END { print c + 0 }' "$WORKDIR/class.all")
-  show_bads "$WORKDIR/class.all"
-  goodn=$((N_DOMAIN + N_SUFFIX + N_IP))
-  if [ "$goodn" -eq 0 ]; then
-    die "名单里没有能用的域名或 IP。"
-  fi
-  say_ok "可用：域名 $N_DOMAIN 个，整段后缀 $N_SUFFIX 个，IP / 网段 $N_IP 个"
-  cap_list "$WORKDIR/good.txt"
+  say_ok "合计可用：域名 $N_DOMAIN 个，整段后缀 $N_SUFFIX 个，IP / 网段 $N_IP 个"
   ask_scope
   confirm_apply
   mkdir -p "$CFG"
+  commit_sources new
   cat "$WORKDIR/good.txt" >"$CFG/list.txt"
   rm -f "$CFG/resolved.last"
   printf '%s\n' "$MODE" >"$CFG/mode"
@@ -2243,13 +2434,12 @@ wizard() {
 }
 
 append_wizard() {
-  raw=$WORKDIR/raw.txt
-  collect_sources "$raw"
-  classify_raw "$raw" "$WORKDIR/good.txt"
-  summarize_list "$WORKDIR/class.all"
-  show_bads "$WORKDIR/class.all"
-  cat "$CFG/list.txt" "$WORKDIR/good.txt" | LC_ALL=C sort -u >"$WORKDIR/merged.txt"
-  cap_list "$WORKDIR/merged.txt"
+  migrate_sources
+  if ! collect_sources append; then
+    say_info "没有追加新名单。"
+    return 0
+  fi
+  merge_sources append "$WORKDIR/merged.txt"
   MODE=$(cat "$CFG/mode")
   PORTS=$(cat "$CFG/ports" 2>/dev/null || true)
   if ! ans=$(ask_line "沿用现在的封禁范围？回车沿用，输入 n 重选："); then
@@ -2261,6 +2451,7 @@ append_wizard() {
   summarize_list "$WORKDIR/merged.txt"
   # 确认之后才写回去。取消时名单和范围都保持原样。
   confirm_apply
+  commit_sources append
   cat "$WORKDIR/merged.txt" >"$CFG/list.txt"
   printf '%s\n' "$MODE" >"$CFG/mode"
   printf '%s\n' "$PORTS" >"$CFG/ports"
@@ -2524,8 +2715,20 @@ main() {
   if ! take_lock; then
     die "另一个封禁任务正在跑。"
   fi
+  # 再跑一次一键命令就是更新：新脚本覆盖装好的 vps-fengjin，名单和设置都留着。
+  old_ver=$(sed -n 's/^VERSION=//p' "$(installed_bin)" 2>/dev/null | head -n 1)
   install_self
+  if [ -n "$old_ver" ] && [ "$old_ver" != "$VERSION" ]; then
+    say_ok "已从 $old_ver 更新到 $VERSION。名单和设置都还在。"
+    if [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ]; then
+      say_info "选 1「用现有名单重新生效」，封禁规则才会换成新版本的。"
+    fi
+  elif [ -n "$old_ver" ]; then
+    say_info "已经是最新版本 $VERSION。"
+  fi
   if [ -f "$CFG/list.txt" ]; then
+    migrate_sources
+    [ -f "$CFG/mode" ] && write_status
     menu
   else
     intro
