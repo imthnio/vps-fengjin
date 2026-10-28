@@ -101,7 +101,7 @@ printf '%s\n' \
   "ip6	2001:db8::9" \
   "ip6	2001:db9::5" \
   "domain	example.com" \
-  | fengjin_awk overlap "$tmp/peers" "" "$tmp/skip" | LC_ALL=C sort >"$tmp/kept"
+  | fengjin_awk overlap peers="$tmp/peers" skipfile="$tmp/skip" | LC_ALL=C sort >"$tmp/kept"
 eq "overlap kept" "$(cat "$tmp/kept")" "$(printf '%s\n' 'domain	example.com' 'ip4	8.8.8.8' 'ip6	2001:db8::9' 'ip6	2001:db9::5' 'net4	9.9.9.0/24')"
 eq "overlap skip6" "$(awk -F '\t' '$1 == "2001:db8::/32" { print $1 }' "$tmp/skip")" "2001:db8::/32"
 
@@ -109,11 +109,22 @@ printf '%s\n' \
   "Server: 1.1.1.1" \
   "Address: 1.1.1.1#53" \
   "" \
+  "@@@ example.com" \
   "Name: example.com" \
   "Address: 93.184.216.34" \
-  "example.net." \
-  | fengjin_awk extract "" "1.1.1.1" >"$tmp/ips"
-eq "extract" "$(cat "$tmp/ips")" "93.184.216.34"
+  "@@@ nothing.example" \
+  "** server can't find nothing.example: NXDOMAIN" \
+  "@@@ local.example" \
+  "local.example has address 127.0.0.2" \
+  ";www.example.org.		IN	A" \
+  "www.example.org.	300	IN	CNAME	edge.example.net." \
+  "edge.example.net.	60	IN	A	203.0.113.7" \
+  ";www.example.org.		IN	AAAA" \
+  "edge.example.net.	60	IN	AAAA	2001:DB8::7" \
+  ";; communications error to 1.1.1.1#53: timed out" \
+  | fengjin_awk extract server=1.1.1.1 okfile="$tmp/ok" >"$tmp/ips"
+eq "extract" "$(cat "$tmp/ips")" "$(printf '%s\n' 93.184.216.34 203.0.113.7 2001:db8::7)"
+eq "extract ok count" "$(cat "$tmp/ok")" "2"
 
 mkdir -p "$tmp/plan"
 printf '%s\n' all >"$tmp/plan/mode"
@@ -122,32 +133,54 @@ printf '%s\n' "1.2.3.4" "10.1.0.0/24" >"$tmp/plan/v4"
 printf '%s\n' "2001:db8::1" >"$tmp/plan/v6"
 printf '%s\n' string >"$tmp/plan/dns.method"
 printf '%s\n' example.com >"$tmp/plan/dns.list"
-fengjin_awk rules "" "" "" "$tmp/plan" 4 1 bm reset reject 1 >"$tmp/r4"
-eq "rule set" "$(grep -c -- '-m set --match-set vps_fengjin4 dst -j REJECT' "$tmp/r4")" "1"
-eq "rule dns" "$(grep -c -- '076578616d706c6503636f6d' "$tmp/r4")" "2"
-eq "rule dns end" "$(grep -c -- '|076578616d706c6503636f6d00|' "$tmp/r4")" "2"
+rules() {
+  fengjin_awk rules plan="$tmp/plan" fam="$1" multiport="$2" algo="$3" icase=1 rtcp=reset roth=reject useset="$4" cap=1500 nodns="${5:-0}"
+}
+rules 4 1 bm 1 >"$tmp/r4"
+eq "rule set tcp" "$(grep -c -- '-m set --match-set vps_fengjin4 dst -p tcp -j REJECT --reject-with tcp-reset' "$tmp/r4")" "1"
+eq "rule set other" "$(grep -c -- '-m set --match-set vps_fengjin4 dst -j REJECT$' "$tmp/r4")" "1"
+eq "rule dns" "$(grep -c -- '|076578616d706c6503636f6d00|' "$tmp/r4")" "2"
+eq "rule dns icase" "$(grep -c -- '--algo bm --icase' "$tmp/r4")" "2"
+eq "rule chain" "$(grep -vc '^-A VPS_FENGJIN ' "$tmp/r4" || true)" "0"
 eq "rule no zero" "$(grep -c '0.0.0.0/0' "$tmp/r4" || true)" "0"
+rules 4 1 bm 1 1 >"$tmp/r4n"
+eq "rule nodns" "$(grep -c 'dport 53' "$tmp/r4n" || true)" "0"
+rules 4 1 "" 1 >"$tmp/r4a"
+eq "rule no string support" "$(grep -c 'string' "$tmp/r4a" || true)" "0"
+rules 6 1 bm 1 >"$tmp/r6"
+eq "rule set6" "$(grep -c -- 'vps_fengjin6' "$tmp/r6")" "2"
 
 printf '%s\n' ports >"$tmp/plan/mode"
 printf '%s\n' "80,443" >"$tmp/plan/ports"
 printf '%s\n' none >"$tmp/plan/dns.method"
-fengjin_awk rules "" "" "" "$tmp/plan" 4 1 bm reset reject 1 >"$tmp/rp"
+rules 4 1 bm 1 >"$tmp/rp"
 eq "port dports" "$(grep -c -- '--dports 80,443' "$tmp/rp")" "2"
 eq "port no dns" "$(grep -c 'dport 53' "$tmp/rp" || true)" "0"
 
-fengjin_awk rules "" "" "" "$tmp/plan" 4 0 bm reset reject 0 >"$tmp/rd"
+rules 4 0 bm 0 >"$tmp/rd"
 eq "no ipset uses dest" "$(grep -c -- '-d 1.2.3.4' "$tmp/rd")" "4"
 eq "split ports" "$(grep -c -- '--dport 443' "$tmp/rd")" "4"
 eq "no multiport" "$(grep -c multiport "$tmp/rd" || true)" "0"
+fengjin_awk rules plan="$tmp/plan" fam=4 multiport=1 useset=0 cap=1 >"$tmp/rcap"
+eq "no ipset cap" "$(grep -c -- '-d 10.1.0.0/24' "$tmp/rcap" || true)" "0"
 
-fengjin_awk ipset "" "" "" "$tmp/plan" 4 >"$tmp/set4"
-eq "ipset add" "$(grep -c 'add vps_fengjin4 1.2.3.4' "$tmp/set4")" "1"
-eq "ipset cidr" "$(grep -c 'add vps_fengjin4 10.1.0.0/24' "$tmp/set4")" "1"
+fengjin_awk ipset plan="$tmp/plan" fam=4 setname=vps_fengjin4 >"$tmp/set4"
+eq "ipset temp" "$(grep -c '^create vps_fengjin4_n hash:net family inet ' "$tmp/set4")" "1"
+eq "ipset add" "$(grep -c '^add vps_fengjin4_n 1.2.3.4 -exist$' "$tmp/set4")" "1"
+eq "ipset cidr" "$(grep -c '^add vps_fengjin4_n 10.1.0.0/24 -exist$' "$tmp/set4")" "1"
+: >"$tmp/plan/v6"
+ec=0
+fengjin_awk ipset plan="$tmp/plan" fam=6 setname=vps_fengjin6 >/dev/null || ec=$?
+eq "ipset empty" "$ec" "1"
+printf '%s\n' "2001:db8::1" >"$tmp/plan/v6"
 
+fengjin_awk nft plan="$tmp/plan" >"$tmp/nftp"
+eq "nft ports tcp" "$(grep -c 'ip daddr @block4 tcp dport { 80, 443 } reject with tcp reset' "$tmp/nftp")" "1"
 printf '%s\n' all >"$tmp/plan/mode"
-fengjin_awk nft "" "" "" "$tmp/plan" >"$tmp/nft"
+fengjin_awk nft plan="$tmp/plan" >"$tmp/nft"
 eq "nft hook" "$(grep -c 'hook output' "$tmp/nft")" "1"
 eq "nft v4" "$(grep -c '1.2.3.4' "$tmp/nft")" "1"
+eq "nft v6" "$(grep -c 'ip6 daddr @block6' "$tmp/nft")" "2"
 eq "nft no forward" "$(grep -c 'hook forward' "$tmp/nft" || true)" "0"
 
 if grep -q FORWARD install.sh; then
