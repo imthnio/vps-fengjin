@@ -20,7 +20,7 @@
 # 64MB 内存的小鸡也能跑：不装大软件，临时文件放硬盘，解析域名的并发按内存定。
 #======================================================================
 
-VERSION=2.0.0
+VERSION=2.0.1
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -900,30 +900,32 @@ make_swap() {
   say_ok "已加上 64MB 交换空间"
 }
 
+# 安装输出写进 pm.log，装失败时给用户看最后几行，不再一声不吭。
 pm_install() {
+  _pm_log=${WORKDIR:-/tmp}/pm.log
   case ${PM:-none} in
     apt)
       export DEBIAN_FRONTEND=noninteractive
       if [ "${APT_UPDATED:-0}" != 1 ]; then
-        apt-get update -qq >/dev/null 2>&1 || say_warn "软件源没有完全更新，仍尝试安装。"
+        apt-get update -qq >>"$_pm_log" 2>&1 || say_warn "软件源没有完全更新，仍尝试安装。"
         APT_UPDATED=1
       fi
       apt-get install -y -qq --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
-        "$1" >/dev/null 2>&1
+        "$1" >>"$_pm_log" 2>&1
       ;;
-    apk) apk add --no-cache "$1" >/dev/null 2>&1 ;;
-    dnf) dnf install -y -q "$1" >/dev/null 2>&1 ;;
-    yum) yum install -y -q "$1" >/dev/null 2>&1 ;;
-    pacman) pacman -Sy --noconfirm "$1" >/dev/null 2>&1 ;;
-    zypper) zypper --non-interactive -q install "$1" >/dev/null 2>&1 ;;
+    apk) apk add --no-cache "$1" >>"$_pm_log" 2>&1 ;;
+    dnf) dnf install -y -q "$1" >>"$_pm_log" 2>&1 ;;
+    yum) yum install -y -q "$1" >>"$_pm_log" 2>&1 ;;
+    pacman) pacman -Sy --noconfirm "$1" >>"$_pm_log" 2>&1 ;;
+    zypper) zypper --non-interactive -q install "$1" >>"$_pm_log" 2>&1 ;;
     opkg)
       if [ "${OPKG_UPDATED:-0}" != 1 ]; then
-        opkg update >/dev/null 2>&1 || say_warn "opkg 源更新失败，仍尝试安装。"
+        opkg update >>"$_pm_log" 2>&1 || say_warn "opkg 源更新失败，仍尝试安装。"
         OPKG_UPDATED=1
       fi
-      opkg install "$1" >/dev/null 2>&1
+      opkg install "$1" >>"$_pm_log" 2>&1
       ;;
     *) return 1 ;;
   esac
@@ -936,10 +938,14 @@ need_cmd() {
   command -v "$_nc_cmd" >/dev/null 2>&1 && return 0
   for _nc_pkg in "$@"; do
     say_info "缺少 $_nc_cmd，尝试安装 $_nc_pkg"
+    : >"${WORKDIR:-/tmp}/pm.log"
     if pm_install "$_nc_pkg" && command -v "$_nc_cmd" >/dev/null 2>&1; then
+      say_ok "已装上 $_nc_pkg"
       return 0
     fi
   done
+  say_warn "$_nc_cmd 没装上。安装输出的最后几行："
+  tail -n 3 "${WORKDIR:-/tmp}/pm.log" 2>/dev/null | sed 's/^/    /'
   return 1
 }
 
@@ -957,12 +963,23 @@ ipt_try() {
   return $_it_rc
 }
 
-# 探测一个协议族的 iptables 能力，结果放在 P_ 开头的变量里。
+# 一个协议族可以用的 iptables 命令，按顺序试。
+# NAT 小鸡上常见：默认的 iptables 是 nft 版，内核或容器不支持，旧版 iptables-legacy 却能用。
+ipt_candidates() {
+  if [ "$1" = 6 ]; then
+    printf '%s\n' ip6tables ip6tables-legacy ip6tables-nft
+  else
+    printf '%s\n' iptables iptables-legacy iptables-nft
+  fi
+}
+
+# 探测一个协议族的 iptables 能力，结果放在 P_ 开头的变量里。P_BIN 是能用的命令。
 # IPv4 和 IPv6 分开探：有的机器 ip6tables 缺模块，不能拿 IPv4 的结果套用。
 probe_ipt_family() {
-  _pf_bin=$1
-  _pf_fam=$2
+  _pf_fam=inet
+  [ "$1" = 6 ] && _pf_fam=inet6
   P_OK=0
+  P_BIN=""
   P_REJECT=0
   P_RESET=0
   P_MULTI=0
@@ -970,55 +987,87 @@ probe_ipt_family() {
   P_STRING=0
   P_ALGO=bm
   P_ICASE=0
-  command -v "$_pf_bin" >/dev/null 2>&1 || return 0
-  "$_pf_bin" -F VPS_FENGJIN_T >/dev/null 2>&1
-  "$_pf_bin" -X VPS_FENGJIN_T >/dev/null 2>&1
-  "$_pf_bin" -N VPS_FENGJIN_T >/dev/null 2>&1 || return 0
+  for _pf_bin in $(ipt_candidates "$1"); do
+    command -v "$_pf_bin" >/dev/null 2>&1 || continue
+    "$_pf_bin" -F VPS_FENGJIN_T >/dev/null 2>&1
+    "$_pf_bin" -X VPS_FENGJIN_T >/dev/null 2>&1
+    if "$_pf_bin" -N VPS_FENGJIN_T >/dev/null 2>"$WORKDIR/ipt.err"; then
+      P_BIN=$_pf_bin
+      break
+    fi
+    # 记下报错，都用不了时给用户看。
+    [ "$1" = 4 ] && printf '%s：%s\n' "$_pf_bin" "$(head -n 1 "$WORKDIR/ipt.err")" >>"$WORKDIR/fw.err"
+  done
+  [ -n "$P_BIN" ] || return 0
   P_OK=1
-  ipt_try "$_pf_bin" -j REJECT && P_REJECT=1
-  ipt_try "$_pf_bin" -p tcp -j REJECT --reject-with tcp-reset && P_RESET=1
-  ipt_try "$_pf_bin" -p tcp -m multiport --dports 80,443 -j RETURN && P_MULTI=1
+  ipt_try "$P_BIN" -j REJECT && P_REJECT=1
+  ipt_try "$P_BIN" -p tcp -j REJECT --reject-with tcp-reset && P_RESET=1
+  ipt_try "$P_BIN" -p tcp -m multiport --dports 80,443 -j RETURN && P_MULTI=1
   if command -v ipset >/dev/null 2>&1; then
     ipset destroy vps_fengjin_t >/dev/null 2>&1
     if ipset create vps_fengjin_t hash:net family "$_pf_fam" maxelem 16 >/dev/null 2>&1; then
-      ipt_try "$_pf_bin" -m set --match-set vps_fengjin_t dst -j RETURN && P_SET=1
+      ipt_try "$P_BIN" -m set --match-set vps_fengjin_t dst -j RETURN && P_SET=1
       ipset destroy vps_fengjin_t >/dev/null 2>&1
     fi
   fi
   for _pf_algo in bm kmp; do
-    if ipt_try "$_pf_bin" -p udp --dport 53 -m string --hex-string "|61|" --algo "$_pf_algo" -j RETURN; then
+    if ipt_try "$P_BIN" -p udp --dport 53 -m string --hex-string "|61|" --algo "$_pf_algo" -j RETURN; then
       P_STRING=1
       P_ALGO=$_pf_algo
-      ipt_try "$_pf_bin" -p udp --dport 53 -m string --hex-string "|61|" --algo "$_pf_algo" --icase -j RETURN && P_ICASE=1
+      ipt_try "$P_BIN" -p udp --dport 53 -m string --hex-string "|61|" --algo "$_pf_algo" --icase -j RETURN && P_ICASE=1
       break
     fi
   done
-  "$_pf_bin" -X VPS_FENGJIN_T >/dev/null 2>&1
+  "$P_BIN" -X VPS_FENGJIN_T >/dev/null 2>&1
 }
 
 probe_firewall() {
   [ "${PROBED:-0}" = 1 ] && return 0
   PROBED=1
+  : >"$WORKDIR/fw.err"
   for _m in ip_tables iptable_filter ip6_tables ip6table_filter ip_set ip_set_hash_net \
     xt_set xt_string xt_multiport nf_tables; do
     modprobe "$_m" >/dev/null 2>&1
   done
-  probe_ipt_family iptables inet
-  for _v in OK REJECT RESET MULTI SET STRING ALGO ICASE; do
-    eval "V4_$_v=\$P_$_v"
-  done
-  probe_ipt_family ip6tables inet6
-  for _v in OK REJECT RESET MULTI SET STRING ALGO ICASE; do
-    eval "V6_$_v=\$P_$_v"
+  for _fam in 4 6; do
+    probe_ipt_family "$_fam"
+    for _v in OK BIN REJECT RESET MULTI SET STRING ALGO ICASE; do
+      eval "V${_fam}_$_v=\$P_$_v"
+    done
   done
   FW_BACKEND=none
   if [ "$V4_OK" = 1 ]; then
     FW_BACKEND=iptables
-  elif command -v nft >/dev/null 2>&1 \
-    && nft add table inet vpsfengjin_t >/dev/null 2>&1 \
-    && nft delete table inet vpsfengjin_t >/dev/null 2>&1; then
-    FW_BACKEND=nft
+  elif command -v nft >/dev/null 2>&1; then
+    if nft add table inet vpsfengjin_t >/dev/null 2>"$WORKDIR/nft.err" \
+      && nft delete table inet vpsfengjin_t >/dev/null 2>&1; then
+      FW_BACKEND=nft
+    else
+      printf 'nft：%s\n' "$(head -n 1 "$WORKDIR/nft.err")" >>"$WORKDIR/fw.err"
+    fi
   fi
+}
+
+# 防火墙都用不了时，说清楚是什么机器、卡在哪、怎么办。
+fw_diagnose() {
+  say_err "这台机器改不了防火墙，规则加不上，所以没法封。"
+  if [ -s "$WORKDIR/fw.err" ]; then
+    say "  报错是："
+    sed 's/^/    /' "$WORKDIR/fw.err"
+  fi
+  if [ -f /proc/user_beancounters ] && [ ! -d /proc/bc ]; then
+    say "  这是 OpenVZ 小鸡，防火墙模块由商家的宿主机决定。请在商家面板里打开 iptables"
+    say "  （有的叫 Netfilter、防火墙模块），或者发工单请商家开通，开好后再运行一次。"
+  elif [ -f /.dockerenv ] || grep -q -E 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+    say "  这是 Docker 容器，默认没有改防火墙的权限。请在宿主机上运行这个脚本，"
+    say "  或者给容器加上 --cap-add=NET_ADMIN 后重启容器。"
+  elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null \
+    || [ "$(systemd-detect-virt -c 2>/dev/null)" = lxc ]; then
+    say "  这是 LXC 容器，需要宿主机给容器 NET_ADMIN 权限（商家的小鸡请发工单开通）。"
+  else
+    say "  可能是内核没有带 netfilter 模块，或者这台机器被限制了权限。"
+  fi
+  exit 1
 }
 
 # 设置时用：缺 iptables / ipset 先试着装，实在不行再用 nftables。
@@ -1027,18 +1076,24 @@ ensure_firewall() {
   command -v ipset >/dev/null 2>&1 || need_cmd ipset ipset || true
   PROBED=0
   probe_firewall
+  # Alpine 3.19 起 iptables 默认是 nft 版，旧版接口要单独装。
+  if [ "$V4_OK" != 1 ] && [ "${PM:-none}" = apk ] && ! command -v iptables-legacy >/dev/null 2>&1; then
+    need_cmd iptables-legacy iptables-legacy || true
+    PROBED=0
+    probe_firewall
+  fi
   if [ "$FW_BACKEND" = none ] && ! command -v nft >/dev/null 2>&1; then
     need_cmd nft nftables nft || true
     PROBED=0
     probe_firewall
   fi
-  [ "$FW_BACKEND" != none ] || die "这台机器不能改防火墙（iptables 和 nft 都用不了）。有些被切出来的小鸡没有这个权限。"
+  [ "$FW_BACKEND" != none ] || fw_diagnose
   if [ "$FW_BACKEND" = nft ]; then
     say_ok "防火墙：nftables"
   elif [ "$V4_SET" = 1 ]; then
-    say_ok "防火墙：iptables + ipset"
+    say_ok "防火墙：$V4_BIN + ipset"
   else
-    say_warn "有 iptables，但 ipset 用不了（常见于部分 NAT 小鸡）。地址只能一条条写进规则，最多写 $(no_ipset_rule_cap) 条，超出的不拦。"
+    say_warn "有 $V4_BIN，但 ipset 用不了（常见于部分 NAT 小鸡）。地址只能一条条写进规则，最多写 $(no_ipset_rule_cap) 条，超出的不拦。"
   fi
 }
 
@@ -1053,15 +1108,16 @@ ipv6_on() {
 # 新规则加不上时，旧规则原样留着，不会出现一条都不拦的空档。
 #----------------------------------------------------------------------
 
+# legacy 和 nft 两套规则表是分开的，每种命令都清一遍。
 remove_ipt_family() {
-  _rf_bin=iptables
-  [ "$1" = 6 ] && _rf_bin=ip6tables
-  command -v "$_rf_bin" >/dev/null 2>&1 || return 0
-  while "$_rf_bin" -C OUTPUT -j "$CHAIN" >/dev/null 2>&1; do
-    "$_rf_bin" -D OUTPUT -j "$CHAIN" >/dev/null 2>&1 || break
+  for _rf_bin in $(ipt_candidates "$1"); do
+    command -v "$_rf_bin" >/dev/null 2>&1 || continue
+    while "$_rf_bin" -C OUTPUT -j "$CHAIN" >/dev/null 2>&1; do
+      "$_rf_bin" -D OUTPUT -j "$CHAIN" >/dev/null 2>&1 || break
+    done
+    "$_rf_bin" -F "$CHAIN" >/dev/null 2>&1
+    "$_rf_bin" -X "$CHAIN" >/dev/null 2>&1
   done
-  "$_rf_bin" -F "$CHAIN" >/dev/null 2>&1
-  "$_rf_bin" -X "$CHAIN" >/dev/null 2>&1
   return 0
 }
 
@@ -1112,9 +1168,7 @@ load_set() {
 apply_ipt_family() {
   _af=$1
   _af_nodns=${2:-0}
-  _af_bin=iptables
-  [ "$_af" = 6 ] && _af_bin=ip6tables
-  eval "_af_ok=\$V${_af}_OK _af_set=\$V${_af}_SET _af_multi=\$V${_af}_MULTI _af_rst=\$V${_af}_RESET"
+  eval "_af_bin=\$V${_af}_BIN _af_ok=\$V${_af}_OK _af_set=\$V${_af}_SET _af_multi=\$V${_af}_MULTI _af_rst=\$V${_af}_RESET"
   eval "_af_rej=\$V${_af}_REJECT _af_str=\$V${_af}_STRING _af_algo=\$V${_af}_ALGO _af_icase=\$V${_af}_ICASE"
   if [ "$_af_ok" != 1 ]; then
     remove_ipt_family "$_af"
@@ -1222,7 +1276,10 @@ rules_live() {
   case $(cat "$CFG/backend" 2>/dev/null) in
     nft) nft list table inet "$NFT_TABLE" >/dev/null 2>&1 ;;
     *)
-      iptables -C OUTPUT -j "$CHAIN" >/dev/null 2>&1 || ip6tables -C OUTPUT -j "$CHAIN" >/dev/null 2>&1
+      for _rl_bin in $(ipt_candidates 4) $(ipt_candidates 6); do
+        "$_rl_bin" -C OUTPUT -j "$CHAIN" >/dev/null 2>&1 && return 0
+      done
+      return 1
       ;;
   esac
 }
@@ -1718,17 +1775,24 @@ rebuild_ips() {
   _rb_method=$(choose_dns_method "$_rb_nnames" "$_rb_mode")
   # 后缀只能解析主名字。按端口封、或者域名拦截只靠 hosts 时，顺带解析 www.，
   # dnsmasq 和拦 DNS 查询本身就连子域名一起拦，不用多查一倍。
+  # 后缀超过 5000 个（例如整份去广告名单）也不加，不然小鸡要多跑一倍的时间。
+  _rb_www=$(count_lines "$WORKDIR/www.names")
   case $_rb_method in
-    string|dnsmasq) LC_ALL=C sort -u "$WORKDIR/dns.names" -o "$WORKDIR/names" ;;
-    *) cat "$WORKDIR/dns.names" "$WORKDIR/www.names" | LC_ALL=C sort -u >"$WORKDIR/names" ;;
+    string|dnsmasq) _rb_www=0 ;;
+    *) [ "$_rb_www" -le 5000 ] || _rb_www=0 ;;
   esac
+  if [ "$_rb_www" -gt 0 ]; then
+    cat "$WORKDIR/dns.names" "$WORKDIR/www.names" | LC_ALL=C sort -u >"$WORKDIR/names"
+  else
+    LC_ALL=C sort -u "$WORKDIR/dns.names" -o "$WORKDIR/names"
+  fi
   if [ "$_rb_nnames" -gt 0 ]; then
     ensure_resolver "$1"
     if [ "$RESOLVER" = none ]; then
       say_warn "没有查 DNS 的命令，域名这次变不成 IP。"
     else
       # 刷新时拦 DNS 查询的规则也会挡住脚本自己的查询，先换成不拦查询的规则。
-      if [ "$FW_BACKEND" = iptables ] && iptables -C OUTPUT -j "$CHAIN" >/dev/null 2>&1; then
+      if [ "$FW_BACKEND" = iptables ] && "$V4_BIN" -C OUTPUT -j "$CHAIN" >/dev/null 2>&1; then
         apply_firewall 1 >/dev/null 2>&1 || true
       fi
       pick_dns_server
