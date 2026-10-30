@@ -12,18 +12,30 @@
 sh -c 'c(){ command -v "$1" >/dev/null 2>&1; }; c curl || c wget || { for pm in "apk add --no-cache" "apt-get install -y" "dnf install -y" "yum install -y" "pacman -Sy --noconfirm" "zypper --non-interactive install" "opkg install"; do b=${pm%% *}; c $b || continue; [ "$b" = apt-get ] && { apt-get update -qq 2>/dev/null || sudo apt-get update -qq 2>/dev/null; }; $pm curl wget ca-certificates 2>/dev/null || sudo $pm curl wget ca-certificates 2>/dev/null; break; done; c curl || c wget || { echo "装不上 curl / wget，请手动装一个"; exit 1; }; }; ok=""; for u in https://raw.githubusercontent.com/imthnio/vps-fengjin/main/install.sh https://cdn.jsdelivr.net/gh/imthnio/vps-fengjin@main/install.sh; do (wget -qO /tmp/vps-fengjin.sh "$u" || curl -fsSL -o /tmp/vps-fengjin.sh "$u") 2>/dev/null && [ -s /tmp/vps-fengjin.sh ] && head -n 1 /tmp/vps-fengjin.sh | grep -q "^#!/bin/sh" && grep -q vps-fengjin-onekey-begin /tmp/vps-fengjin.sh && { ok=1; break; }; rm -f /tmp/vps-fengjin.sh; done; [ -n "$ok" ] || { echo "下载 install.sh 失败，请检查网络"; exit 1; }; sh /tmp/vps-fengjin.sh'
 ```
 
+## 它能做什么
+
+典型用法：你在这台机器上搭了节点（任意端口都行），想让用这个节点上网的人打不开名单里的网站和 App。运行脚本、加上名单、确认，就行了。
+
 ## 它会问什么
 
-第一次运行一共三步，每一步都有默认值，直接回车就是推荐的选项：
+第一次运行只有两步，每一步都有默认值，直接回车就是推荐的选项：
 
 1. **添加名单**。可以填网址、这台机器上的文件路径，或者直接粘贴（粘贴完另起一行输入 `END`）。在菜单提示处直接粘贴网址也行。可以加好几份，每份自动起名字，能查看、改名、删掉刚加的。一行一个，域名和 IP 可以混在一起。
    名单文件最大 32MB。内存 192MB 以下（包括 64MB 小鸡）最多 10 万个域名，更大的机器最多 50 万个，整份去广告名单也吃得下。临时文件放在硬盘上，不占内存盘。
-2. **封禁范围**。
-   - 整台机器（默认）：不管哪个端口，都不让访问名单里的地址。
-   - 只封指定的目标端口：例如 `443`，或 `80,443`，最多 30 个。别的端口还能连。
+2. **确认**。列出要封的条数和方式，输入 `y` 才会生效；其他输入都算取消，什么都不改。
 
-   这里的端口是**对方网站的端口**，不是这台机器对外开的端口。
-3. **确认**。列出要封的条数和范围，输入 `y` 才会改防火墙；其他输入都算取消，什么都不改。
+默认封整台机器：不管哪个端口，这台机器（包括上面的节点）都连不上名单里的地址。**不用填你节点的端口。**
+极少数情况下只想封对方网站的某些端口（例如只拦 443），可以在之后的菜单里选“修改封禁范围（高级）”。
+
+## 不能改防火墙的机器（容器、部分 NAT 小鸡）
+
+脚本开头会先检查这台机器有没有改防火墙的权限。有的商家给的是容器，没有这个权限（NET_ADMIN），root 也改不了防火墙。这时脚本会自动改成**只拦域名**：
+
+- 装一个很小的 dnsmasq，让这台机器查不到名单里的域名（子域名一起拦），节点自然也就打不开这些网站和 App。
+- 名单里的 IP / 网段封不了。
+- 节点程序如果自己指定了别的 DNS 服务器（不走系统 DNS），可能拦不住。生效后用节点试一下，还能打开的话，重启一下节点程序。
+- 容器重启后，运行一次 `vps-fengjin on` 就会重新生效。
+- 想全部封住，可以请商家开通 iptables（NET_ADMIN）权限，开好后再运行一次脚本，会自动改用防火墙。
 
 输错了会提示重输，不会退出；输入中途断了（例如管道里的答案不够），会明确告诉你，不会卡住。
 
@@ -101,7 +113,7 @@ sh install.sh check 名单.txt  只检查这份名单，不改防火墙
 - 走加密 DNS（443 或 853 上的 DoH、DoT）的程序，可能绕过“拦域名查询”。整台机器模式下，已经解析到的 IP 仍然封着。
 - 有 iptables 但没有 ipset 时（常见于部分 NAT 小鸡），地址得一条条写进规则，按内存给了上限（128MB 以下约 1500 条，内存越大上限越高），超出部分不拦。
 - 默认的 iptables 用不了时（NAT 小鸡上常见：系统自带的是 nft 版，内核不支持），会自动改用 `iptables-legacy`，再不行才用 nftables。
-- 实在改不了防火墙时，脚本会打印真实报错，并按机器类型（OpenVZ、Docker、LXC）说明要找商家开什么权限。
+- 实在改不了防火墙时，自动改成只拦域名，见上面“不能改防火墙的机器”。
 - 别的防火墙（firewalld、ufw）重载时可能清掉规则。`vps-fengjin status` 会提示，`refresh` 或下一次定时刷新会重新封上。
 
 ## 赞赏支持

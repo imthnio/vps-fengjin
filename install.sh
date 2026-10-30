@@ -20,7 +20,7 @@
 # 64MB 内存的小鸡也能跑：不装大软件，临时文件放硬盘，解析域名的并发按内存定。
 #======================================================================
 
-VERSION=2.0.1
+VERSION=2.1.0
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -1021,10 +1021,30 @@ probe_ipt_family() {
   "$P_BIN" -X VPS_FENGJIN_T >/dev/null 2>&1
 }
 
+# 有没有改防火墙的权限（CAP_NET_ADMIN）。商家没给这个权限的容器，root 也改不了。
+# 看不出来时当作有，交给后面实际试。
+has_net_admin() {
+  _hn_cap=$(awk '/^CapEff:/ { print $2; exit }' /proc/self/status 2>/dev/null)
+  [ -n "$_hn_cap" ] || return 0
+  # CAP_NET_ADMIN 是第 12 位，在倒数第 4 个十六进制数字里。
+  case $(printf '%s' "$_hn_cap" | awk '{ print substr($0, length($0) - 3, 1) }') in
+    [13579bBdDfF]) return 0 ;;
+  esac
+  return 1
+}
+
 probe_firewall() {
   [ "${PROBED:-0}" = 1 ] && return 0
   PROBED=1
   : >"$WORKDIR/fw.err"
+  FW_BACKEND=none
+  for _fam in 4 6; do
+    for _v in OK SET STRING MULTI REJECT RESET ICASE; do
+      eval "V${_fam}_$_v=0"
+    done
+    eval "V${_fam}_BIN='' V${_fam}_ALGO=bm"
+  done
+  has_net_admin || return 0
   for _m in ip_tables iptable_filter ip6_tables ip6table_filter ip_set ip_set_hash_net \
     xt_set xt_string xt_multiport nf_tables; do
     modprobe "$_m" >/dev/null 2>&1
@@ -1035,7 +1055,6 @@ probe_firewall() {
       eval "V${_fam}_$_v=\$P_$_v"
     done
   done
-  FW_BACKEND=none
   if [ "$V4_OK" = 1 ]; then
     FW_BACKEND=iptables
   elif command -v nft >/dev/null 2>&1; then
@@ -1048,53 +1067,55 @@ probe_firewall() {
   fi
 }
 
-# 防火墙都用不了时，说清楚是什么机器、卡在哪、怎么办。
-fw_diagnose() {
-  say_err "这台机器改不了防火墙，规则加不上，所以没法封。"
-  if [ -s "$WORKDIR/fw.err" ]; then
-    say "  报错是："
+# 防火墙用不了时，用大白话说清楚原因和影响。
+fw_explain() {
+  say_warn "这台机器改不了防火墙，改为“只拦域名”。"
+  if ! has_net_admin; then
+    say "  原因：这台机器是容器，商家没有给它改防火墙的权限（NET_ADMIN），root 也改不了。"
+  else
+    say "  原因：防火墙命令都报错："
     sed 's/^/    /' "$WORKDIR/fw.err"
   fi
-  if [ -f /proc/user_beancounters ] && [ ! -d /proc/bc ]; then
-    say "  这是 OpenVZ 小鸡，防火墙模块由商家的宿主机决定。请在商家面板里打开 iptables"
-    say "  （有的叫 Netfilter、防火墙模块），或者发工单请商家开通，开好后再运行一次。"
-  elif [ -f /.dockerenv ] || grep -q -E 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
-    say "  这是 Docker 容器，默认没有改防火墙的权限。请在宿主机上运行这个脚本，"
-    say "  或者给容器加上 --cap-add=NET_ADMIN 后重启容器。"
-  elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null \
-    || [ "$(systemd-detect-virt -c 2>/dev/null)" = lxc ]; then
-    say "  这是 LXC 容器，需要宿主机给容器 NET_ADMIN 权限（商家的小鸡请发工单开通）。"
-  else
-    say "  可能是内核没有带 netfilter 模块，或者这台机器被限制了权限。"
-  fi
-  exit 1
+  say "  只拦域名的效果：这台机器（包括你搭的节点）查不到名单里的域名，也就打不开这些网站和 App。"
+  say "  做不到的：名单里的 IP / 网段封不了；节点程序如果自己指定了别的 DNS，可能拦不住。"
+  say "  想全部封住，可以请商家开通 iptables（NET_ADMIN）权限，开好后再运行一次脚本。"
 }
 
-# 设置时用：缺 iptables / ipset 先试着装，实在不行再用 nftables。
-ensure_firewall() {
-  command -v iptables >/dev/null 2>&1 || need_cmd iptables iptables || true
-  command -v ipset >/dev/null 2>&1 || need_cmd ipset ipset || true
+# 设置前先看这台机器能不能改防火墙。缺 iptables / ipset 先试着装，
+# 实在不行再用 nftables；都不行就只拦域名（FW_BACKEND=none）。
+fw_precheck() {
+  [ "${FW_CHECKED:-0}" = 1 ] && return 0
+  FW_CHECKED=1
   PROBED=0
-  probe_firewall
-  # Alpine 3.19 起 iptables 默认是 nft 版，旧版接口要单独装。
-  if [ "$V4_OK" != 1 ] && [ "${PM:-none}" = apk ] && ! command -v iptables-legacy >/dev/null 2>&1; then
-    need_cmd iptables-legacy iptables-legacy || true
-    PROBED=0
+  if has_net_admin; then
+    command -v iptables >/dev/null 2>&1 || need_cmd iptables iptables || true
+    command -v ipset >/dev/null 2>&1 || need_cmd ipset ipset || true
     probe_firewall
-  fi
-  if [ "$FW_BACKEND" = none ] && ! command -v nft >/dev/null 2>&1; then
-    need_cmd nft nftables nft || true
-    PROBED=0
-    probe_firewall
-  fi
-  [ "$FW_BACKEND" != none ] || fw_diagnose
-  if [ "$FW_BACKEND" = nft ]; then
-    say_ok "防火墙：nftables"
-  elif [ "$V4_SET" = 1 ]; then
-    say_ok "防火墙：$V4_BIN + ipset"
+    # Alpine 3.19 起 iptables 默认是 nft 版，旧版接口要单独装。
+    if [ "$V4_OK" != 1 ] && [ "${PM:-none}" = apk ] && ! command -v iptables-legacy >/dev/null 2>&1; then
+      need_cmd iptables-legacy iptables-legacy || true
+      PROBED=0
+      probe_firewall
+    fi
+    if [ "$FW_BACKEND" = none ] && ! command -v nft >/dev/null 2>&1; then
+      need_cmd nft nftables nft || true
+      PROBED=0
+      probe_firewall
+    fi
   else
-    say_warn "有 $V4_BIN，但 ipset 用不了（常见于部分 NAT 小鸡）。地址只能一条条写进规则，最多写 $(no_ipset_rule_cap) 条，超出的不拦。"
+    probe_firewall
   fi
+  case $FW_BACKEND in
+    none) fw_explain ;;
+    nft) say_ok "防火墙：nftables" ;;
+    *)
+      if [ "$V4_SET" = 1 ]; then
+        say_ok "防火墙：$V4_BIN + ipset"
+      else
+        say_warn "有 $V4_BIN，但 ipset 用不了（常见于部分 NAT 小鸡）。地址只能一条条写进规则，最多写 $(no_ipset_rule_cap) 条，超出的不拦。"
+      fi
+      ;;
+  esac
 }
 
 ipv6_on() {
@@ -1274,6 +1295,13 @@ apply_firewall() {
 # 规则还在不在。被别的防火墙（firewalld、ufw 重载）清掉时，status 会提示。
 rules_live() {
   case $(cat "$CFG/backend" 2>/dev/null) in
+    none)
+      # 只拦域名：看 dnsmasq 还在不在、hosts 里的记录还在不在。
+      case $(cat "$CFG/dns.method" 2>/dev/null) in
+        dnsmasq) dnsmasq_up ;;
+        *) grep -q '^# BEGIN vps-fengjin$' /etc/hosts 2>/dev/null ;;
+      esac
+      ;;
     nft) nft list table inet "$NFT_TABLE" >/dev/null 2>&1 ;;
     *)
       for _rl_bin in $(ipt_candidates 4) $(ipt_candidates 6); do
@@ -1323,7 +1351,10 @@ hosts_apply() {
   } >"$WORKDIR/hosts.new"
   # 内容没变就不写，定时刷新时不反复改文件。
   cmp -s "$WORKDIR/hosts.new" /etc/hosts 2>/dev/null && return 0
-  cat "$WORKDIR/hosts.new" >/etc/hosts
+  if ! cat "$WORKDIR/hosts.new" 2>/dev/null >/etc/hosts; then
+    say_err "/etc/hosts 改不了（只读），域名拦不住。"
+    return 1
+  fi
 }
 
 # 两种情况：
@@ -1357,7 +1388,7 @@ write_dnsmasq_conf() {
   {
     if [ "$2" = 1 ]; then
       printf '%s\n' "listen-address=127.0.0.1" "bind-interfaces" "no-resolv" "no-hosts" \
-        "cache-size=50" "domain-needed"
+        "cache-size=1000" "domain-needed"
       if [ -s "$CFG/upstream.dns" ]; then
         awk 'NF { print "server=" $1 }' "$CFG/upstream.dns"
       else
@@ -1375,19 +1406,38 @@ dnsmasq_reads_confdir() {
   grep -E -q '^[[:space:]]*conf-dir=/etc/dnsmasq\.d' /etc/dnsmasq.conf 2>/dev/null
 }
 
+dnsmasq_up() {
+  pidof dnsmasq >/dev/null 2>&1
+}
+
+kill_dnsmasq() {
+  _kd_pids=$(pidof dnsmasq 2>/dev/null)
+  [ -n "$_kd_pids" ] || return 0
+  # shellcheck disable=SC2086
+  kill $_kd_pids >/dev/null 2>&1
+  sleep 1
+}
+
+# 每种启动方式试过都看一眼 dnsmasq 真的在跑没有。
+# 容器里没有 systemd，也没有在跑的 openrc，服务命令可能“成功”却什么都没启动，
+# 最后直接运行 dnsmasq（它自己会转到后台）。
 restart_dnsmasq() {
-  if [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1; then
-    return 0
-  fi
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemctl enable dnsmasq >/dev/null 2>&1
-    systemctl restart dnsmasq >/dev/null 2>&1 && return 0
+    systemctl restart dnsmasq >/dev/null 2>&1
+    sleep 1
+    dnsmasq_up && return 0
   fi
-  if command -v rc-service >/dev/null 2>&1 && rc-service dnsmasq restart >/dev/null 2>&1; then
-    return 0
+  if [ -x /etc/init.d/dnsmasq ]; then
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    sleep 1
+    dnsmasq_up && return 0
   fi
-  killall dnsmasq >/dev/null 2>&1
-  command -v dnsmasq >/dev/null 2>&1 && dnsmasq
+  kill_dnsmasq
+  command -v dnsmasq >/dev/null 2>&1 || return 1
+  dnsmasq >/dev/null 2>&1
+  sleep 1
+  dnsmasq_up
 }
 
 stop_dnsmasq() {
@@ -1399,7 +1449,7 @@ stop_dnsmasq() {
     rc-update del dnsmasq default >/dev/null 2>&1
   fi
   [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq stop >/dev/null 2>&1
-  killall dnsmasq >/dev/null 2>&1
+  kill_dnsmasq
   return 0
 }
 
@@ -1452,7 +1502,12 @@ dnsmasq_apply() {
     dnsmasq_clear
     return 1
   fi
-  printf '%s\n' "# vps-fengjin managed" "nameserver 127.0.0.1" >/etc/resolv.conf
+  # 有的容器平台把 resolv.conf 设成只读，写不进去就别假装成功。
+  if ! printf '%s\n' "# vps-fengjin managed" "nameserver 127.0.0.1" >/etc/resolv.conf 2>/dev/null; then
+    say_warn "/etc/resolv.conf 改不了（只读），本机不会去问 dnsmasq。"
+    dnsmasq_clear
+    return 1
+  fi
   return 0
 }
 
@@ -1486,6 +1541,11 @@ load_rules() {
     say_warn "当前防火墙不能按域名拦 DNS 查询，改写入 /etc/hosts。"
     _lr_method=hosts
     printf '%s\n' hosts >"$CFG/dns.method"
+  fi
+  if [ "$FW_BACKEND" = none ]; then
+    # 只拦域名：没有防火墙规则可写。开机时也要把 dnsmasq 拉起来（容器里不会自己起）。
+    dns_apply "$_lr_method" || return 1
+    return 0
   fi
   apply_firewall 0 || return 1
   [ "${1:-0}" = 1 ] && dns_apply "$_lr_method"
@@ -1653,16 +1713,26 @@ save_upstreams() {
   fi
   : >"$CFG/upstream.dns"
   # systemd-resolved 的 resolv.conf 只写 127.0.0.53，真正的上游在 /run 里那份。
+  # Docker 的 127.0.0.11 是真正的上游，要留着。
   for _sf in /etc/resolv.conf /run/systemd/resolve/resolv.conf; do
     [ -s "$CFG/upstream.dns" ] && break
-    awk '$1 == "nameserver" && $2 !~ /^127\./ && $2 != "::1" { print $2 }' "$_sf" \
+    awk '$1 == "nameserver" && $2 != "127.0.0.1" && $2 != "127.0.0.53" && $2 != "::1" { print $2 }' "$_sf" \
       >"$CFG/upstream.dns" 2>/dev/null
   done
   [ -s "$CFG/upstream.dns" ] || printf '%s\n' 1.1.1.1 8.8.8.8 >"$CFG/upstream.dns"
 }
 
 choose_dns_method() {
-  if [ "$2" != all ] || [ "$1" -eq 0 ]; then
+  if [ "$1" -eq 0 ]; then
+    printf '%s\n' none
+  elif [ "$FW_BACKEND" = none ]; then
+    # 只拦域名：要连子域名一起拦，优先 dnsmasq，装不上才用 hosts。
+    if [ "$OS_ID" = openwrt ] || command -v dnsmasq >/dev/null 2>&1 || [ "${PM:-none}" != none ]; then
+      printf '%s\n' dnsmasq
+    else
+      printf '%s\n' hosts
+    fi
+  elif [ "$2" != all ]; then
     printf '%s\n' none
   elif [ "$OS_ID" = openwrt ]; then
     printf '%s\n' dnsmasq
@@ -1773,6 +1843,14 @@ rebuild_ips() {
   LC_ALL=C sort -u "$WORKDIR/dns.names" -o "$WORKDIR/dns.list"
   _rb_nnames=$(count_lines "$WORKDIR/dns.list")
   _rb_method=$(choose_dns_method "$_rb_nnames" "$_rb_mode")
+  if [ "$FW_BACKEND" = none ]; then
+    # 只拦域名：IP 没处封，也就不用解析域名。
+    : >"$CFG/v4"
+    : >"$CFG/v6"
+    cat "$WORKDIR/dns.list" >"$CFG/dns.list"
+    printf '%s\n' "$_rb_method" >"$CFG/dns.method"
+    return 0
+  fi
   # 后缀只能解析主名字。按端口封、或者域名拦截只靠 hosts 时，顺带解析 www.，
   # dnsmasq 和拦 DNS 查询本身就连子域名一起拦，不用多查一倍。
   # 后缀超过 5000 个（例如整份去广告名单）也不加，不然小鸡要多跑一倍的时间。
@@ -1952,7 +2030,7 @@ EOF
   elif [ -f /etc/rc.local ]; then
     append_marked /etc/rc.local "$_ip_bin apply-rules"
   else
-    say_warn "没找到开机自启的位置。重启后请再运行一次：vps-fengjin apply-rules"
+    say_warn "这台机器没有开机自启的地方（容器里常见）。机器或容器重启后，运行一次 vps-fengjin on 就会重新生效。"
   fi
   remove_cron
   [ "$_ip_names" -gt 0 ] || return 0
@@ -2392,9 +2470,11 @@ ask_scope() {
   [ "${1:-all}" = ports ] && _sc_def=2
   while :; do
     say ""
-    say "封在什么范围？这里的端口是对方网站的端口，不是这台机器对外开的端口。"
-    say "  1) 整台机器：不管哪个端口，都连不上名单里的地址"
-    say "  2) 只封指定的目标端口，例如 443，或 80,443。别的端口还能连"
+    say "封在什么范围？"
+    say "  1) 整台机器：不管哪个端口，都连不上名单里的地址（推荐）"
+    say "     想让用你节点上网的人打不开名单里的网站和 App，就选这个。"
+    say "  2) 只封对方网站的某些端口，例如 443。别的端口还能连"
+    say "     注意：这里填的是对方网站的端口，不是你节点的端口。一般用不到。"
     ask_pick "请选择 [$_sc_def]: " "$_sc_def" 1 2
     if [ "$ANSWER" = 1 ]; then
       MODE=all
@@ -2431,6 +2511,12 @@ show_plan() {
   say ""
   say "即将生效："
   say "  名单：域名 $((N_DOMAIN + N_SUFFIX)) 个（其中整段后缀 $N_SUFFIX 个），IP / 网段 $N_IP 个"
+  if [ "$FW_BACKEND" = none ]; then
+    say "  方式：只拦域名。这台机器（包括你搭的节点）查不到这些域名，也就打不开这些网站和 App。"
+    [ "$N_IP" -gt 0 ] && say "  名单里的 $N_IP 个 IP / 网段封不了。"
+    [ "$MODE" = all ] || say "  只拦域名时分不了端口，这些域名在所有端口上都会拦。"
+    return 0
+  fi
   say "  范围：$(scope_text "$MODE" "$PORTS")"
   if [ "$MODE" = all ]; then
     say "  域名的解析会被拦住，它们现在解析到的 IP 也会封掉。共用同一个 IP 的网站可能被误伤。"
@@ -2461,14 +2547,14 @@ activate() {
   save_upstreams
   if [ "${1:-setup}" = setup ]; then
     lowmem_prepare
-    ensure_firewall
+    fw_precheck
   else
     probe_firewall
-    [ "$FW_BACKEND" != none ] || die "现在用不了防火墙，规则没生效。"
   fi
   printf '%s\n' "$FW_BACKEND" >"$CFG/backend"
   rebuild_ips "${1:-setup}"
   if [ ! -s "$CFG/v4" ] && [ ! -s "$CFG/v6" ] && [ "$(cat "$CFG/dns.method")" = none ]; then
+    [ "$FW_BACKEND" = none ] && die "这台机器只能拦域名，但名单里没有域名（IP / 网段封不了）。"
     die "没有可以封的地址。按端口封域名时，要先能解析出 IP。"
   fi
   load_rules 1 || exit 1
@@ -2507,7 +2593,12 @@ apply_changes() {
   printf '%s\n' "$PORTS" >"$CFG/ports"
   # 放进子 shell：里面任何一步 die，都只退出子 shell，这里接着恢复。
   if (activate setup); then
-    say_ok "已经生效。重启后会自动封上，名单里有域名时每 6 小时重新解析一次。"
+    if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
+      say_ok "已经生效（只拦域名）。"
+      say "  如果用节点还能打开名单里的网站，重启一下节点程序，让它重新读这台机器的 DNS 设置。"
+    else
+      say_ok "已经生效。重启后会自动封上，名单里有域名时每 6 小时重新解析一次。"
+    fi
     return 0
   fi
   say_err "没有生效，正在恢复原来的设置……"
@@ -2548,7 +2639,11 @@ write_status() {
       printf '%s\n' "状态：关着"
     fi
     printf '系统：%s\n' "${OS_PRETTY:-未知}"
-    printf '范围：%s\n' "$(scope_text "$(cat "$CFG/mode" 2>/dev/null)" "$(cat "$CFG/ports" 2>/dev/null)")"
+    if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
+      printf '%s\n' "方式：只拦域名（这台机器不能改防火墙，所有端口都拦）"
+    else
+      printf '范围：%s\n' "$(scope_text "$(cat "$CFG/mode" 2>/dev/null)" "$(cat "$CFG/ports" 2>/dev/null)")"
+    fi
     printf '名单：域名 %s 个（其中整段后缀 %s 个），IP / 网段 %s 个\n' "$((N_DOMAIN + N_SUFFIX))" "$N_SUFFIX" "$N_IP"
     source_dirs saved >"$WORKDIR/status.idx"
     _ws_i=0
@@ -2556,7 +2651,11 @@ write_status() {
       _ws_i=$((_ws_i + 1))
       show_source_line "$_ws_i" "$_ws_d"
     done <"$WORKDIR/status.idx"
-    printf '实际封住的地址：IPv4 %s 条，IPv6 %s 条\n' "$(count_lines "$CFG/v4")" "$(count_lines "$CFG/v6")"
+    if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
+      printf '%s\n' "IP / 网段：封不了（这台机器不能改防火墙）"
+    else
+      printf '实际封住的地址：IPv4 %s 条，IPv6 %s 条\n' "$(count_lines "$CFG/v4")" "$(count_lines "$CFG/v6")"
+    fi
     case $_ws_method in
       string) printf '%s\n' "域名拦截：拦发往 53 端口的域名查询，不改本机 DNS 设置" ;;
       dnsmasq) printf '%s\n' "域名拦截：dnsmasq 把这些域名回成“不存在”" ;;
@@ -2573,8 +2672,15 @@ show_status() {
     return 0
   fi
   cat "$CFG/status.txt"
-  if [ "$(id -u)" = 0 ] && [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ] \
-    && { [ -s "$CFG/v4" ] || [ -s "$CFG/v6" ] || [ "$(cat "$CFG/dns.method" 2>/dev/null)" = string ]; }; then
+  [ "$(id -u)" = 0 ] && [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ] || return 0
+  if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
+    [ "$(cat "$CFG/dns.method" 2>/dev/null)" = none ] && return 0
+    if rules_live; then
+      say "域名拦截：在运行"
+    else
+      say_warn "域名拦截没在运行（机器或容器重启过？）。运行 vps-fengjin on 重新生效。"
+    fi
+  elif [ -s "$CFG/v4" ] || [ -s "$CFG/v6" ] || [ "$(cat "$CFG/dns.method" 2>/dev/null)" = string ]; then
     if rules_live; then
       say "防火墙规则：在"
     else
@@ -2599,17 +2705,23 @@ intro() {
   say "  DOMAIN-SUFFIX,example.com    IP-CIDR,1.2.3.0/24    0.0.0.0 example.com    ||example.com^"
   say "  Clash 的 YAML 名单（payload:）"
   say ""
-  say "一共三步：添加名单 → 选封禁范围 → 确认。"
+  say "用法很简单：加名单 → 确认。生效后，这台机器（包括你在上面搭的节点）"
+  say "就打不开名单里的网站和 App 了。"
 }
 
 # 第一次设置，或换一套新名单。
+# 第一次设置不问范围，直接封整台机器：新手最容易在这里把节点端口当成目标端口填进去。
+# 换一套名单时沿用原来的范围。要改范围去菜单里的“修改封禁范围”。
 flow_new() {
+  say_step "检查这台机器"
+  fw_precheck
   say_step "第 1 步：添加名单"
   collect_sources new
   merge_sources "$WORKDIR/merged.txt"
-  say_step "第 2 步：封禁范围"
-  ask_scope "$(cat "$CFG/mode" 2>/dev/null)" "$(cat "$CFG/ports" 2>/dev/null)"
-  say_step "第 3 步：确认"
+  MODE=$(cat "$CFG/mode" 2>/dev/null)
+  PORTS=$(cat "$CFG/ports" 2>/dev/null)
+  [ "$MODE" = ports ] || { MODE=all; PORTS=; }
+  say_step "第 2 步：确认"
   show_plan "$WORKDIR/merged.txt"
   confirm_or_cancel || return 0
   apply_changes new "$WORKDIR/merged.txt"
@@ -2624,9 +2736,7 @@ flow_append() {
   merge_sources "$WORKDIR/merged.txt"
   MODE=$(cat "$CFG/mode")
   PORTS=$(cat "$CFG/ports" 2>/dev/null)
-  if ! ask_yn "封禁范围沿用「$(scope_text "$MODE" "$PORTS")」？[Y/n]: " y; then
-    ask_scope "$MODE" "$PORTS"
-  fi
+  fw_precheck
   show_plan "$WORKDIR/merged.txt"
   confirm_or_cancel || return 0
   apply_changes append "$WORKDIR/merged.txt"
@@ -2663,6 +2773,11 @@ flow_manage() {
 }
 
 flow_scope() {
+  fw_precheck
+  if [ "$FW_BACKEND" = none ]; then
+    say_info "这台机器只能拦域名，分不了端口，没有范围可改。"
+    return 0
+  fi
   ask_scope "$(cat "$CFG/mode")" "$(cat "$CFG/ports" 2>/dev/null)"
   show_plan "$CFG/list.txt"
   confirm_or_cancel || return 0
@@ -2717,7 +2832,7 @@ menu() {
     say "  2) 追加名单"
     say "  3) 管理名单（查看、改名、删除）"
     say "  4) 换一套新名单"
-    say "  5) 修改封禁范围"
+    say "  5) 修改封禁范围（高级，一般用不到）"
     say "  6) 关闭封禁，名单留着"
     say "  7) 彻底删除"
     say "  0) 退出"
@@ -2785,6 +2900,7 @@ unattended() {
   else
     PORTS=
   fi
+  fw_precheck
   show_plan "$WORKDIR/merged.txt"
   confirm_or_cancel || exit 0
   if [ "$_un_how" = keep ]; then
