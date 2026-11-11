@@ -20,7 +20,7 @@
 # 64MB 内存的小鸡也能跑：不装大软件，临时文件放硬盘，解析域名的并发按内存定。
 #======================================================================
 
-VERSION=2.1.1
+VERSION=2.1.2
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -3007,8 +3007,10 @@ lock_alive() {
   [ -n "$LOCK_PID" ] || return 1
   kill -0 "$LOCK_PID" 2>/dev/null || return 1
   _la_now=$(proc_start "$LOCK_PID")
-  # 没有 /proc 可查，只能信 PID。
+  # 没有 /proc 可查，只能信 PID，但不敢确定它就是本脚本。
+  LOCK_SURE=0
   [ -n "$_la_now" ] || return 0
+  LOCK_SURE=1
   _la_then=$(sed -n 1p "$LOCKDIR/start" 2>/dev/null)
   if [ -n "$_la_then" ]; then
     [ "$_la_then" = "$_la_now" ]
@@ -3023,29 +3025,45 @@ lock_alive() {
 
 # take_lock [这次在做什么]。拿到返回 0；被别的任务占着返回 1，
 # 这时 LOCK_PID / LOCK_CMD 是占着锁的那个任务。
+# 只有「确实有个活着的本脚本进程占着」才算被占。锁目录建不出来、
+# 残留的删不掉（有的容器 /run 看着可写其实不让写），都不是别人在跑：
+# 换下一个位置，全都不行就不加锁直接干，不能因此把人挡在外面。
+LOCK_BASES="/run /tmp"
 take_lock() {
-  LOCKDIR=/tmp/vps-fengjin.lock
-  [ -d /run ] && [ -w /run ] && LOCKDIR=/run/vps-fengjin.lock
-  for _tl in 1 2 3; do
-    if mkdir "$LOCKDIR" 2>/dev/null; then
-      echo $$ >"$LOCKDIR/pid"
-      proc_start $$ >"$LOCKDIR/start"
-      printf '%s\n' "${1:-setup}" >"$LOCKDIR/cmd"
-      LOCKED=1
-      return 0
-    fi
-    # 对方可能刚建好目录还没写 pid，等一下再判断，免得把活锁当死锁删掉。
-    [ -s "$LOCKDIR/pid" ] || sleep 1
-    lock_alive && return 1
-    rm -rf "$LOCKDIR"
+  LOCKED=0
+  for _tl_base in $LOCK_BASES; do
+    [ -d "$_tl_base" ] || continue
+    LOCKDIR=$_tl_base/vps-fengjin.lock
+    for _tl in 1 2; do
+      if mkdir "$LOCKDIR" 2>/dev/null; then
+        if echo $$ 2>/dev/null >"$LOCKDIR/pid"; then
+          proc_start $$ >"$LOCKDIR/start" 2>/dev/null
+          printf '%s\n' "${1:-setup}" >"$LOCKDIR/cmd" 2>/dev/null
+          LOCKED=1
+          return 0
+        fi
+        rm -rf "$LOCKDIR" 2>/dev/null
+        break
+      fi
+      # 目录不存在却建不出来：这个位置不能用。
+      [ -d "$LOCKDIR" ] || break
+      # 对方可能刚建好目录还没写 pid，等一下再判断，免得把活锁当死锁删掉。
+      [ -s "$LOCKDIR/pid" ] || sleep 1
+      lock_alive && return 1
+      rm -rf "$LOCKDIR" 2>/dev/null
+      [ -d "$LOCKDIR" ] && break
+    done
   done
-  return 1
+  LOCKDIR=
+  return 0
 }
 
-# 设置类命令用：后台的定时刷新 / 开机恢复很快会结束，等它；
-# 别的窗口里开着的就说清楚是谁、怎么办。
+# 设置类命令用，一定拿得到锁：人在这个窗口里等着用，以这里为准。
+# 后台的定时刷新 / 开机恢复很快会结束，先等它；
+# 别的窗口里开着的（或者等不完的）直接关掉，在这里继续。
 take_lock_or_die() {
   _tw=0
+  _tk=0
   while ! take_lock "$1"; do
     case ${LOCK_CMD:-} in
       refresh|apply|apply-rules)
@@ -3057,15 +3075,32 @@ take_lock_or_die() {
         fi
         ;;
     esac
-    say_err "另一个 vps-fengjin 任务正在跑（进程 ${LOCK_PID:-?}）。"
-    say_err "多半是别的窗口里还开着它的菜单：去那边退出再试；找不到那个窗口就先运行 kill ${LOCK_PID:-进程号} 再试。"
-    exit 1
+    _tk=$((_tk + 1))
+    # 关了几次还占着，不再纠缠，不加锁继续。
+    if [ "$_tk" -gt 3 ]; then
+      LOCKED=0
+      LOCKDIR=
+      return 0
+    fi
+    if [ "${LOCK_SURE:-0}" = 1 ]; then
+      say_warn "另一个 vps-fengjin 任务还占着（进程 $LOCK_PID，多半是别的窗口没退出），已把它关掉，在这里继续。"
+      kill "$LOCK_PID" 2>/dev/null
+      for _ti in 1 2 3 4 5 6; do
+        kill -0 "$LOCK_PID" 2>/dev/null || break
+        sleep 0.5 2>/dev/null || sleep 1
+      done
+      kill -9 "$LOCK_PID" 2>/dev/null
+    else
+      # 认不准那个进程号是不是本脚本，不乱杀，只把锁接过来。
+      say_warn "发现另一个 vps-fengjin 任务留下的锁，已接管，在这里继续。"
+    fi
+    [ -n "${LOCKDIR:-}" ] && rm -rf "$LOCKDIR" 2>/dev/null
   done
 }
 
 cleanup() {
   [ -n "${WORKDIR:-}" ] && [ "$WORKDIR" != / ] && rm -rf "$WORKDIR"
-  [ "${LOCKED:-0}" = 1 ] && rm -rf "${LOCKDIR:-/nonexistent}"
+  [ "${LOCKED:-0}" = 1 ] && [ -n "${LOCKDIR:-}" ] && rm -rf "$LOCKDIR"
 }
 
 make_workdir() {
