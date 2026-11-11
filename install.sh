@@ -20,7 +20,7 @@
 # 64MB 内存的小鸡也能跑：不装大软件，临时文件放硬盘，解析域名的并发按内存定。
 #======================================================================
 
-VERSION=2.1.0
+VERSION=2.1.1
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
 SET4=vps_fengjin4
@@ -2992,22 +2992,75 @@ require_linux() {
   [ "$(uname -s)" = Linux ] || die "请在 Linux 服务器上运行。"
 }
 
+# 进程的开机后启动时刻（/proc/PID/stat 第 22 项）。读不到就输出空。
+# PID 会被别的程序重新用上，靠它才能认出「这还是不是当初占锁的那个进程」。
+proc_start() {
+  sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk 'NR == 1 { print $20 }'
+}
+
+# 占锁的进程还在不在。在返回 0。
+# 光看 PID 活着不够：上次被强杀 / 机器或容器重启后锁目录留了下来，
+# 同一个 PID 很可能已经是别的程序，那样会一直误报「另一个任务正在跑」。
+lock_alive() {
+  LOCK_PID=$(sed -n 1p "$LOCKDIR/pid" 2>/dev/null | tr -cd '0-9')
+  LOCK_CMD=$(sed -n 1p "$LOCKDIR/cmd" 2>/dev/null)
+  [ -n "$LOCK_PID" ] || return 1
+  kill -0 "$LOCK_PID" 2>/dev/null || return 1
+  _la_now=$(proc_start "$LOCK_PID")
+  # 没有 /proc 可查，只能信 PID。
+  [ -n "$_la_now" ] || return 0
+  _la_then=$(sed -n 1p "$LOCKDIR/start" 2>/dev/null)
+  if [ -n "$_la_then" ]; then
+    [ "$_la_then" = "$_la_now" ]
+    return
+  fi
+  # 旧版本留下的锁没记启动时刻，看命令行像不像本脚本。
+  case $(tr '\000' ' ' <"/proc/$LOCK_PID/cmdline" 2>/dev/null) in
+    *fengjin*|*install.sh*) return 0 ;;
+  esac
+  return 1
+}
+
+# take_lock [这次在做什么]。拿到返回 0；被别的任务占着返回 1，
+# 这时 LOCK_PID / LOCK_CMD 是占着锁的那个任务。
 take_lock() {
   LOCKDIR=/tmp/vps-fengjin.lock
   [ -d /run ] && [ -w /run ] && LOCKDIR=/run/vps-fengjin.lock
-  for _tl in 1 2; do
+  for _tl in 1 2 3; do
     if mkdir "$LOCKDIR" 2>/dev/null; then
       echo $$ >"$LOCKDIR/pid"
+      proc_start $$ >"$LOCKDIR/start"
+      printf '%s\n' "${1:-setup}" >"$LOCKDIR/cmd"
       LOCKED=1
       return 0
     fi
-    _tl_old=$(cat "$LOCKDIR/pid" 2>/dev/null)
-    if [ -n "$_tl_old" ] && kill -0 "$_tl_old" 2>/dev/null; then
-      return 1
-    fi
+    # 对方可能刚建好目录还没写 pid，等一下再判断，免得把活锁当死锁删掉。
+    [ -s "$LOCKDIR/pid" ] || sleep 1
+    lock_alive && return 1
     rm -rf "$LOCKDIR"
   done
   return 1
+}
+
+# 设置类命令用：后台的定时刷新 / 开机恢复很快会结束，等它；
+# 别的窗口里开着的就说清楚是谁、怎么办。
+take_lock_or_die() {
+  _tw=0
+  while ! take_lock "$1"; do
+    case ${LOCK_CMD:-} in
+      refresh|apply|apply-rules)
+        if [ "$_tw" -lt "${LOCK_WAIT:-180}" ]; then
+          [ "$_tw" = 0 ] && say_info "后台正在刷新封禁地址（进程 $LOCK_PID），等它结束，一般不超过一两分钟……"
+          sleep 2
+          _tw=$((_tw + 2))
+          continue
+        fi
+        ;;
+    esac
+    say_err "另一个 vps-fengjin 任务正在跑（进程 ${LOCK_PID:-?}）。"
+    say_err "多半是别的窗口里还开着它的菜单：去那边退出再试；找不到那个窗口就先运行 kill ${LOCK_PID:-进程号} 再试。"
+    exit 1
+  done
 }
 
 cleanup() {
@@ -3024,14 +3077,15 @@ make_workdir() {
   fi
   LOCKED=0
   trap cleanup EXIT
-  trap 'exit 130' INT TERM
+  # HUP：SSH 断线时也要走 cleanup，不然锁会留下。
+  trap 'exit 130' INT TERM HUP
 }
 
 # 设置类命令都要的准备：root、Linux、锁、把自己装成 vps-fengjin 命令。
 prepare_setup() {
   require_linux
   require_root
-  take_lock || die "另一个 vps-fengjin 任务正在跑，等它结束再试。"
+  take_lock_or_die setup
   detect_os
   _pr_old=$(sed -n 's/^VERSION=//p' "$(installed_bin)" 2>/dev/null | head -n 1)
   install_self
@@ -3070,7 +3124,7 @@ main() {
       require_linux
       require_root
       [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ] || exit 0
-      take_lock || exit 0
+      take_lock apply-rules || exit 0
       detect_os
       load_rules 0
       ;;
@@ -3082,7 +3136,7 @@ main() {
         say_info "封禁是关着的，没有刷新。"
         exit 0
       fi
-      take_lock || { say_warn "另一个 vps-fengjin 任务正在跑，这次跳过。"; exit 0; }
+      take_lock refresh || { say_warn "另一个 vps-fengjin 任务正在跑，这次跳过。"; exit 0; }
       detect_os
       activate refresh
       say_ok "已刷新：IPv4 $(count_lines "$CFG/v4") 条，IPv6 $(count_lines "$CFG/v6") 条。"
@@ -3091,20 +3145,20 @@ main() {
       require_linux
       require_root
       [ -f "$CFG/list.txt" ] || die "还没有名单。运行 sh install.sh 设置。"
-      take_lock || die "另一个 vps-fengjin 任务正在跑。"
+      take_lock_or_die on
       detect_os
       flow_reapply || exit 1
       ;;
     off)
       require_linux
       require_root
-      take_lock || die "另一个 vps-fengjin 任务正在跑。"
+      take_lock_or_die off
       cmd_off
       ;;
     purge)
       require_linux
       require_root
-      take_lock || die "另一个 vps-fengjin 任务正在跑。"
+      take_lock_or_die purge
       cmd_purge
       ;;
     ''|-*)
