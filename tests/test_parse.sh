@@ -105,27 +105,6 @@ printf '%s\n' \
 eq "overlap kept" "$(cat "$tmp/kept")" "$(printf '%s\n' 'domain	example.com' 'ip4	8.8.8.8' 'ip6	2001:db8::9' 'ip6	2001:db9::5' 'net4	9.9.9.0/24')"
 eq "overlap skip6" "$(awk -F '\t' '$1 == "2001:db8::/32" { print $1 }' "$tmp/skip")" "2001:db8::/32"
 
-printf '%s\n' \
-  "Server: 1.1.1.1" \
-  "Address: 1.1.1.1#53" \
-  "" \
-  "@@@ example.com" \
-  "Name: example.com" \
-  "Address: 93.184.216.34" \
-  "@@@ nothing.example" \
-  "** server can't find nothing.example: NXDOMAIN" \
-  "@@@ local.example" \
-  "local.example has address 127.0.0.2" \
-  ";www.example.org.		IN	A" \
-  "www.example.org.	300	IN	CNAME	edge.example.net." \
-  "edge.example.net.	60	IN	A	203.0.113.7" \
-  ";www.example.org.		IN	AAAA" \
-  "edge.example.net.	60	IN	AAAA	2001:DB8::7" \
-  ";; communications error to 1.1.1.1#53: timed out" \
-  | fengjin_awk extract server=1.1.1.1 okfile="$tmp/ok" >"$tmp/ips"
-eq "extract" "$(cat "$tmp/ips")" "$(printf '%s\n' 93.184.216.34 203.0.113.7 2001:db8::7)"
-eq "extract ok count" "$(cat "$tmp/ok")" "2"
-
 mkdir -p "$tmp/plan"
 printf '%s\n' all >"$tmp/plan/mode"
 printf '%s\n' "" >"$tmp/plan/ports"
@@ -134,7 +113,7 @@ printf '%s\n' "2001:db8::1" >"$tmp/plan/v6"
 printf '%s\n' string >"$tmp/plan/dns.method"
 printf '%s\n' example.com >"$tmp/plan/dns.list"
 rules() {
-  fengjin_awk rules plan="$tmp/plan" fam="$1" multiport="$2" algo="$3" icase=1 rtcp=reset roth=reject useset="$4" cap=1500 nodns="${5:-0}"
+  fengjin_awk rules plan="$tmp/plan" fam="$1" multiport="$2" algo="$3" icase=1 rtcp=reset roth=reject useset="$4" cap=1500
 }
 rules 4 1 bm 1 >"$tmp/r4"
 eq "rule set tcp" "$(grep -c -- '-m set --match-set vps_fengjin4 dst -p tcp -j REJECT --reject-with tcp-reset' "$tmp/r4")" "1"
@@ -143,8 +122,6 @@ eq "rule dns" "$(grep -c -- '|076578616d706c6503636f6d00|' "$tmp/r4")" "2"
 eq "rule dns icase" "$(grep -c -- '--algo bm --icase' "$tmp/r4")" "2"
 eq "rule chain" "$(grep -vc '^-A VPS_FENGJIN ' "$tmp/r4" || true)" "0"
 eq "rule no zero" "$(grep -c '0.0.0.0/0' "$tmp/r4" || true)" "0"
-rules 4 1 bm 1 1 >"$tmp/r4n"
-eq "rule nodns" "$(grep -c 'dport 53' "$tmp/r4n" || true)" "0"
 rules 4 1 "" 1 >"$tmp/r4a"
 eq "rule no string support" "$(grep -c 'string' "$tmp/r4a" || true)" "0"
 rules 6 1 bm 1 >"$tmp/r6"
@@ -156,6 +133,12 @@ printf '%s\n' none >"$tmp/plan/dns.method"
 rules 4 1 bm 1 >"$tmp/rp"
 eq "port dports" "$(grep -c -- '--dports 80,443' "$tmp/rp")" "2"
 eq "port no dns" "$(grep -c 'dport 53' "$tmp/rp" || true)" "0"
+# 按端口封时，域名也在 DNS 这一层拦（分不了端口），53 端口的查询照样拦。
+printf '%s\n' string >"$tmp/plan/dns.method"
+rules 4 1 bm 1 >"$tmp/rps"
+eq "port string dns" "$(grep -c 'dport 53' "$tmp/rps")" "2"
+eq "port string dns hex" "$(grep -c -- '|076578616d706c6503636f6d00|' "$tmp/rps")" "2"
+printf '%s\n' none >"$tmp/plan/dns.method"
 
 rules 4 0 bm 0 >"$tmp/rd"
 eq "no ipset uses dest" "$(grep -c -- '-d 1.2.3.4' "$tmp/rd")" "4"
@@ -182,6 +165,40 @@ eq "nft hook" "$(grep -c 'hook output' "$tmp/nft")" "1"
 eq "nft v4" "$(grep -c '1.2.3.4' "$tmp/nft")" "1"
 eq "nft v6" "$(grep -c 'ip6 daddr @block6' "$tmp/nft")" "2"
 eq "nft no forward" "$(grep -c 'hook forward' "$tmp/nft" || true)" "0"
+
+# rebuild_ips：域名只进 dns.list，不解析成 IP；只有名单里直接写的 IP / 网段才进防火墙。
+# 用 TEST-NET 地址，不会撞上本机的地址被当成“不能封”跳过。
+mkdir -p "$tmp/cfg" "$tmp/work"
+CFG="$tmp/cfg"
+WORKDIR="$tmp/work"
+SSH_CONNECTION=
+SSH_CLIENT=
+printf '%s\n' all >"$CFG/mode"
+printf '%s\n' "" >"$CFG/ports"
+printf '%s\n' "domain	example.com" "suffix	ads.example.net" "ip4	192.0.2.9" "net4	198.51.100.0/24" "ip6	2001:db8::1" >"$CFG/list.txt"
+FW_BACKEND=iptables
+OS_ID=debian
+PM=none
+V4_STRING=0
+rebuild_ips
+eq "rebuild v4 only explicit" "$(cat "$CFG/v4")" "$(printf '%s\n' 192.0.2.9 198.51.100.0/24)"
+eq "rebuild v6 only explicit" "$(cat "$CFG/v6")" "2001:db8::1"
+eq "rebuild dns list" "$(cat "$CFG/dns.list")" "$(printf '%s\n' ads.example.net example.com)"
+eq "rebuild dns method" "$(cat "$CFG/dns.method")" "hosts"
+# 按端口封时也一样：域名照样有 DNS 拦截方式，不再是 none。
+printf '%s\n' ports >"$CFG/mode"
+printf '%s\n' "80,443" >"$CFG/ports"
+rebuild_ips
+eq "rebuild ports dns method" "$(cat "$CFG/dns.method")" "hosts"
+eq "rebuild ports v4 only explicit" "$(cat "$CFG/v4")" "$(printf '%s\n' 192.0.2.9 198.51.100.0/24)"
+# 不能改防火墙的机器：IP 没处封，域名照样拦。
+FW_BACKEND=none
+rebuild_ips
+eq "rebuild none v4 empty" "$(cat "$CFG/v4")" ""
+eq "rebuild none v6 empty" "$(cat "$CFG/v6")" ""
+eq "rebuild none dns list" "$(cat "$CFG/dns.list")" "$(printf '%s\n' ads.example.net example.com)"
+if [ "$(cat "$CFG/dns.method")" = none ]; then got=none; else got=some; fi
+eq "rebuild none has dns method" "$got" "some"
 
 if grep -q FORWARD install.sh; then
   printf 'FAIL source contains FORWARD\n' >&2
