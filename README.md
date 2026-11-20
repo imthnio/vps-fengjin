@@ -1,70 +1,81 @@
-# 封禁服务器访问指定网站
+# VPS 出口封禁工具（vps-fengjin）
 
-在一台新的 Linux 服务器上运行一次。脚本自己认出系统，问你名单，再问封整台机器还是只封某些目标端口，确认后生效。也可以用参数一次跑完，不提问。
+让**这台 Linux 服务器自己**访问不了指定的网站域名、IP 或网段。你在服务器上搭建的代理节点（任意端口、任意协议）替用户向外发起连接，也算这台服务器自己发出的连接，因此可以直接用来屏蔽广告、特定网站或 App。
 
-作用是让**这台服务器自己**访问不了名单里的域名、IP 或网段。代理程序替用户连出去，也算这台服务器自己发出的连接。
+64MB 内存的小鸡也能跑：不装大软件，临时文件放在硬盘上不挤占内存盘；内存 ≤ 192MB 时自动开启内存超卖，磁盘够用再自动加 64MB 交换空间。
 
-64MB 内存的小鸡可以跑。脚本不装大软件。内存不超过约 192MB 时，会允许内存超卖；磁盘还够的话，再加 64MB 交换空间。
-
-## 安装（用 root 运行，一行）
+## 一键安装 / 更新（root 运行）
 
 ```sh
 sh -c 'c(){ command -v "$1" >/dev/null 2>&1; }; c curl || c wget || { for pm in "apk add --no-cache" "apt-get install -y" "dnf install -y" "yum install -y" "pacman -Sy --noconfirm" "zypper --non-interactive install" "opkg install"; do b=${pm%% *}; c $b || continue; [ "$b" = apt-get ] && { apt-get update -qq 2>/dev/null || sudo apt-get update -qq 2>/dev/null; }; $pm curl wget ca-certificates 2>/dev/null || sudo $pm curl wget ca-certificates 2>/dev/null; break; done; c curl || c wget || { echo "装不上 curl / wget，请手动装一个"; exit 1; }; }; ok=""; for u in https://raw.githubusercontent.com/imthnio/vps-fengjin/main/install.sh https://cdn.jsdelivr.net/gh/imthnio/vps-fengjin@main/install.sh; do (wget -qO /tmp/vps-fengjin.sh "$u" || curl -fsSL -o /tmp/vps-fengjin.sh "$u") 2>/dev/null && [ -s /tmp/vps-fengjin.sh ] && head -n 1 /tmp/vps-fengjin.sh | grep -q "^#!/bin/sh" && grep -q vps-fengjin-onekey-begin /tmp/vps-fengjin.sh && { ok=1; break; }; rm -f /tmp/vps-fengjin.sh; done; [ -n "$ok" ] || { echo "下载 install.sh 失败，请检查网络"; exit 1; }; sh /tmp/vps-fengjin.sh'
 ```
 
-## 它能做什么
+> 再次运行上面的一键命令即自动更新到最新版，原有配置和名单都会完整保留。
 
-典型用法：你在这台机器上搭了节点（任意端口都行），想让用这个节点上网的人打不开名单里的网站和 App。运行脚本、加上名单、确认，就行了。
+## 首次使用：只需 2 步
 
-## 它会问什么
+脚本会自动检测系统和防火墙能力，然后进入大白话 2 步向导（所有选项 `0` 统一表示返回/取消，直接回车即推荐项）：
 
-第一次运行只有两步，每一步都有默认值，直接回车就是推荐的选项：
+1. **添加你要封禁的网站或 IP**
+   - 可以**直接在菜单里输入域名或 IP**（如 `baidu.com` 或 `baidu.com, qq.com, 1.2.3.4`），或批量粘贴（输完另起一行输入 `ok` 或 `完成` 回车）。
+   - 可以**直接粘贴在线名单链接**（GitHub 普通网页链接会自动转成 Raw 直链，不用自己找 Raw 按钮）。
+   - 可以**导入服务器本地文件**（如 `/root/block.txt`）。
+   - 支持添加多份名单，每份独立保存，支持预览内容、重命名、删除。
+   - 单个名单最大 32MB；内存 ≤ 192MB 最多支持 10 万个域名，更大内存支持 50 万个域名。
+2. **核对并生效**
+   - 清晰列出域名/IP 数量、示例条目、生效范围与防误封保护，直接回车立即生效；也可随时返回修改名单、调整高级端口范围或取消退出。
 
-1. **添加名单**。可以填网址、这台机器上的文件路径，或者直接粘贴（粘贴完另起一行输入 `END`）。在菜单提示处直接粘贴网址也行。可以加好几份，每份自动起名字，能查看、改名、删掉刚加的。一行一个，域名和 IP 可以混在一起。
-   名单文件最大 32MB。内存 192MB 以下（包括 64MB 小鸡）最多 10 万个域名，更大的机器最多 50 万个，整份去广告名单也吃得下。临时文件放在硬盘上，不占内存盘。
-2. **确认**。列出要封的条数和方式，输入 `y` 才会生效；其他输入都算取消，什么都不改。
+默认**全局封禁**（本机及所有代理节点均无法访问，**不用填写节点端口**）。只有极少数场景只想封对方网站的某些目标端口（例如只封 443）时，才需要在核对页或菜单里进入“高级设置”。
 
-默认封整台机器：不管哪个端口，这台机器（包括上面的节点）都连不上名单里的地址。**不用填你节点的端口。**
-极少数情况下只想封对方网站的某些端口（例如只拦 443），可以在之后的菜单里选“修改封禁范围（高级）”。
-
-## 不能改防火墙的机器（容器、部分 NAT 小鸡）
-
-脚本开头会先检查这台机器有没有改防火墙的权限。有的商家给的是容器，没有这个权限（NET_ADMIN），root 也改不了防火墙。这时脚本会自动改成**只拦域名**：
-
-- 装一个很小的 dnsmasq，让这台机器查不到名单里的域名（子域名一起拦），节点自然也就打不开这些网站和 App。
-- 名单里的 IP / 网段封不了。
-- 节点程序如果自己指定了别的 DNS 服务器（不走系统 DNS），可能拦不住。生效后用节点试一下，还能打开的话，重启一下节点程序。
-- 容器重启后，运行一次 `vps-fengjin on` 就会重新生效。
-- 想全部封住，可以请商家开通 iptables（NET_ADMIN）权限，开好后再运行一次脚本，会自动改用防火墙。
-
-输错了会提示重输，不会退出；输入中途断了（例如管道里的答案不够），会明确告诉你，不会卡住。
-
-支持这些写法：
+## 支持的名单格式（可混写）
 
 ```text
-example.com
+baidu.com
+baidu.com, qq.com, 1.2.3.4
 *.example.com
 .example.com
++.example.com
+https://www.example.com/path
 1.2.3.4
 1.2.3.0/24
+DOMAIN,www.example.com
 DOMAIN-SUFFIX,example.com
-IP-CIDR,1.2.3.0/24
+IP-CIDR,1.2.3.0/24,no-resolve
 IP-CIDR6,2001:db8::/32,no-resolve
-+.example.com
 - 'DOMAIN-SUFFIX,example.com'
 0.0.0.0 example.com
 ||example.com^
+address=/example.com/0.0.0.0
+full:www.example.com
+domain:example.com
 ```
 
-Clash 的 YAML 名单（以 `payload:` 开头、每行前面有 `- `，带不带引号都行）也能直接用。文件开头的隐藏标记（BOM）和 Windows 换行会自动忽略。
+- Clash YAML（`payload:` 开头、`- ` 列表项、单双引号）、AdGuard / EasyList、Hosts、v2fly / geosite、带 BOM 或 Windows 换行的文件均自动识别。
+- 比 `/16` 更宽的 IPv4 网段与比 `/32` 更宽的 IPv6 网段会自动跳过，避免误写导致整机断网。
+- **防误封保护**：自动跳过你当前的 SSH 登录来源（含 `sudo` 场景、IPv6 及自定义 SSH 端口）、本机网卡地址、本机上游 DNS，不会把自己锁在外面。
 
-`/16` 比这更宽的 IPv4 网段，以及 `/32` 比这更宽的 IPv6 网段，会跳过。这样一份写错的名单不会把整台机器的出口封死。
+## 日常管理与常用命令
 
-这些地址永远不封，名单里包含它们的条目会跳过并提示：你当前的 SSH 来源（也会从正在连着 sshd 的连接里找，包括改过的 SSH 端口）、本机地址、本机用的 DNS 服务器。
+安装完成后，随时输入 `vps-fengjin` 打开管理菜单：
+- 查看运行状态与规则健康度（若被 UFW/firewalld 重载冲掉会立即提示）
+- 添加封禁、查看与管理名单（**预览内容** / **一键更新在线链接** / 改名 / 删除）
+- **实测验证**：输入任意网址或 IP，立刻告诉你是否命中名单及是否已被成功拦截
+- 一键暂停 / 开启封禁（保留名单）、更换整套名单、高级范围设置、彻底卸载
 
-## 不提问，直接用参数跑
+也可以直接在终端使用子命令：
 
-适合批量部署或写进别的脚本：
+```sh
+vps-fengjin                     打开管理菜单
+vps-fengjin status              查看详细状态与规则实时检查
+vps-fengjin test baidu.com      实测某个网站或 IP 是否已被封住
+vps-fengjin update-lists        重新下载所有在线链接名单并生效
+vps-fengjin refresh             按已存名单重新生效
+vps-fengjin on | off            开启 / 暂停封禁（保留名单）
+vps-fengjin purge               彻底卸载
+vps-fengjin check 名单或网址     只检查名单内容，不改防火墙
+```
+
+## 参数化无交互运行（适合批量部署）
 
 ```sh
 sh /tmp/vps-fengjin.sh -l https://example.com/block.list -y
@@ -73,51 +84,23 @@ cat list.txt | sh /tmp/vps-fengjin.sh -l - -y
 ```
 
 ```text
--l, --list 名单    名单网址或文件路径，可以写多次；写 - 表示从标准输入读
--a, --all          封整台机器（默认）
--p, --ports 端口   只封这些目标端口，例如 80,443
-    --replace      换掉原来的名单（默认是追加到原来的名单里）
--y, --yes          不再确认，直接生效
+-l, --list 名单    名单网址或文件路径，可写多次；写 - 表示从标准输入读
+-a, --all          全局封禁（默认）
+-p, --ports 端口   仅封这些目标端口，例如 80,443（仅对 IP/网段生效）
+    --replace      替换原有全部名单（默认是追加）
+-y, --yes          跳过确认，直接生效
 ```
 
-不加 `-y` 时仍然会问一次确认。
+## 拦截原理与边界
 
-## 封完以后
-
-再运行 `vps-fengjin` 是一个菜单：重新生效、追加名单、管理名单（查看、改名、删除）、换一套新名单、修改封禁范围、关闭、彻底删除。
-
-```sh
-vps-fengjin status          查看（包括规则是不是被别的防火墙清掉了）
-vps-fengjin refresh         按保存的名单重新封一次
-vps-fengjin on              按保存的名单重新打开
-vps-fengjin off             关闭，名单留着
-vps-fengjin purge           彻底删除
-sh install.sh check 名单.txt  只检查这份名单，不改防火墙
-```
-
-**更新**：再运行一次上面的一键安装命令就是更新。名单和设置都会留着，脚本会提示从哪个版本更新到哪个版本，并问要不要马上用新版本重新生效。
-
-重启后会按上次保存的结果自动再封上，每 6 小时还会自动重新封一次（防止别的防火墙重载把规则清掉）。
-
-**改规则不会出现空档**：每次生效都是先把新规则准备好，再一次性换上（iptables-restore、ipset swap、nft 事务）。新规则加不上时，原来的规则和设置都原样恢复。
-
-## 域名怎么封
-
-- 域名只在解析这一层拦：优先拦截发往 53 端口的域名查询（大小写混写也拦得住），不改本机的 DNS 设置；域名多于 400 个时改用 dnsmasq，不行再写入 `/etc/hosts`。域名解析到的 IP 不再封，共用同一个 IP 的网站不会被误伤。名单里直接写的 IP / 网段照常走防火墙封。
-- 按端口封时，只有名单里直接写的 IP / 网段才按端口封；域名分不了端口，在所有端口上都拦。
-
-## 边界
-
-- 只拦这台机器自己发出去的连接。它只是把别人的流量原样转发出去时，不拦。
-- 走加密 DNS（443 或 853 上的 DoH、DoT）的程序，可能绕过“拦域名查询”。域名解析到的 IP 不再封，这类程序一旦自己解析出 IP，就拦不住了。
-- 有 iptables 但没有 ipset 时（常见于部分 NAT 小鸡），地址得一条条写进规则，按内存给了上限（128MB 以下约 1500 条，内存越大上限越高），超出部分不拦。
-- 默认的 iptables 用不了时（NAT 小鸡上常见：系统自带的是 nft 版，内核不支持），会自动改用 `iptables-legacy`，再不行才用 nftables。
-- 实在改不了防火墙时，自动改成只拦域名，见上面“不能改防火墙的机器”。
-- 别的防火墙（firewalld、ufw）重载时可能清掉规则。`vps-fengjin status` 会提示，`refresh` 或下一次定时刷新会重新封上。
+- **域名不误伤同 IP 网站**：域名仅在 DNS 解析层拦截（含所有子域名），不封解析出来的 IP，共用同一 CDN/IP 的正常网站不受影响；名单里直接写的 IP / 网段走防火墙拦截。
+- **高性能低开销**：400 个以内域名且支持 `iptables` 字符串匹配时，使用独立子链仅对 53 端口 DNS 查询做匹配（不改系统 DNS，普通代理流量几乎零开销）；大名单、nftables 或无防火墙权限的机器自动使用轻量的 `dnsmasq`（已兼容 Ubuntu 等 `systemd-resolved` 环境，关闭/卸载时原样恢复），兜底才写入 `/etc/hosts`。
+- **原子切换、无空档、失败自动回滚**：通过 `iptables-restore --noflush`、`ipset swap`、`nft` 事务一次性替换规则；若生效失败会自动还原修改前的全部配置与规则。
+- **开机自启与定时巡检**：重启后自动恢复封禁，并每 6 小时自动巡检一次防止规则被其他防火墙重载清除。
+- **受限容器（无 NET_ADMIN 权限）**：自动切换为“仅封禁域名”模式；名单里的 IP/网段会跳过。若代理程序自行指定了 DoH/DoT 加密 DNS，可能绕过 DNS 层拦截；容器重启后如未自动恢复，运行 `vps-fengjin on` 即可。
 
 ## 赞赏支持
 如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  
 微信扫一扫下方赞赏码即可：
 
 ![赞赏码](./appreciate.png)
-

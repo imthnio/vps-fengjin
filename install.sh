@@ -1,34 +1,39 @@
 #!/bin/sh
 # vps-fengjin-onekey-begin
 #======================================================================
-# 封禁一台服务器访问指定的域名、IP、网段。
+# VPS 出口封禁工具（vps-fengjin）
 #
-# 第一次运行会一步步问：名单从哪来、封整台机器还是只封某些目标端口、确认。
-# 以后再运行是菜单：重新生效、追加、管理名单、换名单、改范围、关闭、删除。
-# 也可以不提问，直接用参数跑完（适合批量部署）：
+# 让这台服务器（含上面搭建的代理节点）无法访问指定的网站域名、IP 或网段。
+# 第一次运行：2 步向导（添加名单 → 核对生效），全程大白话，小白也能轻松上手。
+# 之后再运行：进入管理菜单（添加/查看/更新/删除名单、测试是否封住、暂停/开启、卸载）。
 #
-#   sh install.sh                          按提示设置 / 打开菜单
-#   sh install.sh -l 名单网址或文件 -y        整台机器封，不提问
-#   sh install.sh -l 名单 -p 80,443 -y      只封这些目标端口，不提问
-#   sh install.sh status                   查看
-#   sh install.sh refresh                  按保存的名单重新封一次
-#   sh install.sh apply-rules              只按保存的结果封，不改 DNS 设置（开机用）
-#   sh install.sh on | off                 打开 / 关闭，名单留着
-#   sh install.sh purge                    彻底删除
-#   sh install.sh check 文件                只检查名单，不改防火墙
+# 也支持命令行参数直接执行（适合自动化或批量部署）：
+#   sh install.sh                          首次向导 / 管理菜单
+#   sh install.sh -l 名单网址或文件 -y        全局封禁，不提问
+#   sh install.sh -l 名单 -p 80,443 -y      仅封指定目标端口，不提问
+#   vps-fengjin status                     查看状态与规则健康度
+#   vps-fengjin test 域名或IP               测试某个网站或 IP 是否已被封住
+#   vps-fengjin update-lists               重新下载所有在线链接名单并生效
+#   vps-fengjin refresh                    按已存名单重新生效（定时巡检用）
+#   vps-fengjin apply-rules                开机恢复规则（开机自启用）
+#   vps-fengjin on | off                   开启 / 暂停封禁（保留名单）
+#   vps-fengjin purge                      彻底卸载
+#   vps-fengjin check 文件或网址            只检查名单内容，不改防火墙
 #
-# 64MB 内存的小鸡也能跑：不装大软件，临时文件放硬盘。
-# 域名只在 DNS 这一层拦（拦查询 / dnsmasq / hosts），不封它解析到的 IP，
-# 共用同一个 IP 的网站不会被误伤；名单里直接写的 IP / 网段照常走防火墙封。
+# 64MB 内存小鸡也能跑：不装大软件，临时文件放硬盘。
+# 域名只在 DNS 解析层拦截（含子域名），不封解析出来的 IP，不会误伤同 IP 的其他网站；
+# 名单里直接写的 IP / 网段走防火墙拦截。
 #======================================================================
 
-VERSION=2.2.0
+VERSION=3.0.0
 CFG=/etc/vps-fengjin
 CHAIN=VPS_FENGJIN
+DNS_CHAIN=VPS_FENGJIN_DNS
 SET4=vps_fengjin4
 SET6=vps_fengjin6
 NFT_TABLE=vpsfengjin
 BIN_DEFAULT=/usr/local/sbin/vps-fengjin
+BIN_LINK=/usr/local/bin/vps-fengjin
 
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
@@ -38,24 +43,41 @@ if [ -t 1 ]; then
   C_GREEN=$(printf '\033[0;32m')
   C_YELLOW=$(printf '\033[1;33m')
   C_BLUE=$(printf '\033[0;34m')
+  C_CYAN=$(printf '\033[1;36m')
+  C_BOLD=$(printf '\033[1m')
+  C_DIM=$(printf '\033[2m')
   C_NC=$(printf '\033[0m')
 else
   C_RED=''
   C_GREEN=''
   C_YELLOW=''
   C_BLUE=''
+  C_CYAN=''
+  C_BOLD=''
+  C_DIM=''
   C_NC=''
 fi
 
 say()      { printf '%s\n' "$*"; }
 say_ok()   { printf '%s\n' "${C_GREEN}✓ $*${C_NC}"; }
-say_info() { printf '%s\n' "${C_BLUE}$*${C_NC}"; }
+say_info() { printf '%s\n' "${C_BLUE}ℹ $*${C_NC}"; }
 say_warn() { printf '%s\n' "${C_YELLOW}! $*${C_NC}"; }
 say_err()  { printf '%s\n' "${C_RED}✗ $*${C_NC}" >&2; }
-say_step() { printf '\n%s\n' "${C_YELLOW}>>> $*${C_NC}"; }
+say_dim()  { printf '%s\n' "${C_DIM}$*${C_NC}"; }
+say_step() {
+  printf '\n%s\n' "${C_DIM}────────────────────────────────────────────${C_NC}"
+  printf '%s\n' "${C_CYAN}  $*${C_NC}"
+  printf '%s\n' "${C_DIM}────────────────────────────────────────────${C_NC}"
+}
+ui_hr()    { printf '%s\n' "${C_DIM}────────────────────────────────────────────${C_NC}"; }
+ui_banner() {
+  printf '\n%s\n' "${C_CYAN}============================================${C_NC}"
+  printf '%s\n' "${C_BOLD}  VPS 出口封禁工具 (vps-fengjin)  v${VERSION}${C_NC}"
+  printf '%s\n' "${C_CYAN}============================================${C_NC}"
+}
 die()      { say_err "$*"; exit 1; }
 
-# 数文件里的非空行。文件不存在算 0。
+# 统计文件里的非空行数，文件不存在算 0。
 count_lines() {
   if [ -f "$1" ]; then
     awk 'NF { c++ } END { print c + 0 }' "$1"
@@ -65,9 +87,9 @@ count_lines() {
 }
 
 #----------------------------------------------------------------------
-# 纯判断。测试直接调用，不改系统。
-#   fengjin_awk 模式 [名字=值 ...]
-# 模式：classify / ports / wire / overlap / rules / ipset / nft
+# 纯逻辑引擎（AWK）。测试可直接调用，不改系统。
+#   fengjin_awk 模式 [变量=值 ...]
+# 模式：classify / ports / wire / overlap / match / rules / ipset / nft
 #----------------------------------------------------------------------
 
 FENGJIN_AWK='
@@ -113,7 +135,7 @@ function v4_network(ip, bits,   n, shift, net) {
 }
 function v4_contains(net, ip,   a, base, bits, shift) {
   if (index(net, "/") > 0) {
-    split(net, a, "/")
+    if (split(net, a, "/") != 2) return 0
     base = a[1]
     bits = a[2] + 0
   } else {
@@ -184,7 +206,7 @@ function hexval(c) {
 }
 function v6_contains(net, ip,   a, base, bits, eb, ei, full, rem, sh, nb, ni) {
   if (index(net, "/") > 0) {
-    split(net, a, "/")
+    if (split(net, a, "/") != 2) return 0
     base = a[1]
     bits = a[2] + 0
   } else {
@@ -216,7 +238,6 @@ function v6_network(s, bits,   e, full, rem, out, nb, sh, i, g, best, bestlen, r
     out = out sprintf("%x", int(nb / sh) * sh)
   }
   while (length(out) < 32) out = out "0"
-  # 压缩成常见写法：去掉前导 0，最长的一段全 0 写成 ::
   best = 0
   bestlen = 0
   run = 0
@@ -259,24 +280,28 @@ function is_domain(s,   n, i, lab) {
     if (length(lab[i]) < 1 || length(lab[i]) > 63) return 0
     if (lab[i] !~ /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) return 0
   }
-  # 顶级域不会是纯数字。hosts 名单里的 "0.0.0.0 0.0.0.0" 这类行不能当域名。
   return lab[n] !~ /^[0-9]+$/
 }
 function is_sink(s) {
   return s == "0.0.0.0" || s == "127.0.0.1" || s == "::" || s == "::1" || s == "255.255.255.255"
 }
+function is_hosts_boilerplate(s) {
+  s = tolower(s)
+  return s == "localhost" || s == "localhost.localdomain" || s == "local" \
+    || s == "broadcasthost" || s == "ip6-localhost" || s == "ip6-loopback" \
+    || s == "ip6-localnet" || s == "ip6-mcastprefix" || s == "ip6-allnodes" \
+    || s == "ip6-allrouters" || s == "ip6-allhosts"
+}
 function emit_name(kind, host) {
   host = tolower(trim(host))
   sub(/\.$/, "", host)
   if (substr(host, 1, 2) == "*." || substr(host, 1, 2) == "+.") {
-    # +.example.com 是 Clash 的写法，和 *.example.com 一样表示本域名和所有子域名。
     kind = "suffix"
     host = substr(host, 3)
   } else if (substr(host, 1, 1) == ".") {
     kind = "suffix"
     host = substr(host, 2)
   }
-  # 有的名单把 IP 写在域名位置，例如 DOMAIN-SUFFIX,1.2.3.4。按 IP 封。
   if (is_ipv4(host) || is_ipv6(host)) {
     emit_addr(host)
     return
@@ -290,7 +315,7 @@ function emit_name(kind, host) {
 function emit_addr(s,   a, left, bits, net) {
   s = trim(s)
   if (index(s, "/") > 0) {
-    split(s, a, "/")
+    if (split(s, a, "/") != 2) { bad("parse", s); return }
     left = a[1]
     bits = a[2]
     if (is_ipv4(left)) {
@@ -306,7 +331,6 @@ function emit_addr(s,   a, left, bits, net) {
       if ((bits + 0) < 32) { bad("wide", s); return }
       left = tolower(left)
       if (v6_special(left)) { bad("local", s); return }
-      # 把主机位清零。nft 的区间集合不接受带主机位的网段。
       net = v6_network(left, bits + 0)
       if (v6_special(net)) { bad("local", s); return }
       print "net6\t" net "/" (bits + 0)
@@ -336,18 +360,54 @@ function strip_url(s) {
   }
   return s
 }
-function emit_addr_or_name(s,   n, f, i, host) {
-  n = split(s, f, /[ \t]+/)
-  if (n >= 2 && is_sink(f[1])) {
-    for (i = 2; i <= n; i++) emit_name("domain", f[i])
-    return
+# 判断单个词像不像一个合法目标（用于支持小白在一行里用逗号/空格输入多个网站或 IP）
+function looks_like_target(t,   h, a) {
+  t = trim(t)
+  if (t == "") return 0
+  t = strip_url(t)
+  if (substr(t, 1, 1) == "[" && match(t, /^\[[0-9A-Fa-f:]+\]/)) {
+    return is_ipv6(substr(t, 2, RLENGTH - 2))
   }
-  if (n >= 2) {
-    bad("parse", s)
+  if (t ~ /^[0-9.]+:[0-9]+$/) sub(/:[0-9]+$/, "", t)
+  if (is_ipv4(t) || is_ipv6(t)) return 1
+  if (index(t, "/") > 0) {
+    split(t, a, "/")
+    if (is_ipv4(a[1]) || is_ipv6(a[1])) return (split(t, a, "/") == 2 && a[2] ~ /^[0-9]+$/)
+    h = a[1]
+    sub(/:[0-9]+$/, "", h)
+    return is_domain(tolower(h))
+  }
+  h = tolower(t)
+  if (substr(h, 1, 2) == "*." || substr(h, 1, 2) == "+.") h = substr(h, 3)
+  else if (substr(h, 1, 1) == ".") h = substr(h, 2)
+  sub(/\.$/, "", h)
+  if (h ~ /:[0-9]+$/) sub(/:[0-9]+$/, "", h)
+  return is_domain(h)
+}
+function emit_single_target(s,   a, host) {
+  s = strip_url(trim(s))
+  if (substr(s, 1, 1) == "[" && match(s, /^\[[0-9A-Fa-f:]+\]/)) {
+    emit_addr(substr(s, 2, RLENGTH - 2))
     return
   }
   if (s ~ /^[0-9.]+:[0-9]+$/) sub(/:[0-9]+$/, "", s)
-  if (is_ipv4(s) || is_ipv6(s) || index(s, "/") > 0) {
+  if (is_ipv4(s) || is_ipv6(s)) {
+    emit_addr(s)
+    return
+  }
+  if (index(s, "/") > 0) {
+    split(s, a, "/")
+    if (is_ipv4(a[1]) || is_ipv6(a[1])) {
+      emit_addr(s)
+      return
+    }
+    # 像 www.baidu.com/s?wd=123 这种没带 https:// 的网址，提取前面的域名。
+    host = a[1]
+    sub(/:[0-9]+$/, "", host)
+    if (is_domain(tolower(host))) {
+      emit_name("domain", host)
+      return
+    }
     emit_addr(s)
     return
   }
@@ -361,39 +421,78 @@ function emit_addr_or_name(s,   n, f, i, host) {
   }
   emit_name("domain", s)
 }
-function do_classify(   s, f, kind, host) {
+function emit_addr_or_name(s,   n, f, i, all_ok, t) {
+  n = split(s, f, /[ \t]+/)
+  if (n >= 2 && is_sink(f[1])) {
+    for (i = 2; i <= n; i++) {
+      if (is_hosts_boilerplate(f[i]) || is_sink(f[i])) continue
+      emit_name("domain", f[i])
+    }
+    return
+  }
+  if (n >= 2) {
+    # 小白用空格隔开写多个网站/IP 时，只有每个词都合法才拆分，避免把英文句子误认。
+    all_ok = 1
+    for (i = 1; i <= n; i++) {
+      if (!looks_like_target(f[i])) { all_ok = 0; break }
+    }
+    if (all_ok) {
+      for (i = 1; i <= n; i++) emit_single_target(f[i])
+      return
+    }
+    bad("parse", s)
+    return
+  }
+  emit_single_target(s)
+}
+function do_classify(   s, f, kind, host, n, i, all_ok, t) {
   s = $0
-  # 文件开头可能带 UTF-8 的 BOM（看不见的标记），会让第一行认不出来。
   sub(/^\357\273\277/, "", s)
   s = trim(s)
-  if (s == "" || substr(s, 1, 1) == "#" || substr(s, 1, 1) == "!") return
-  if (substr(s, 1, 2) == "@@") return
+  if (s == "" || substr(s, 1, 1) == "#" || substr(s, 1, 1) == "!" || substr(s, 1, 1) == ";") return
+  if (substr(s, 1, 2) == "@@" || substr(s, 1, 2) == "//") return
   sub(/[ \t]+#.*/, "", s)
   s = trim(s)
   if (s == "") return
-  # Clash 的 YAML 名单：第一行 payload:，后面每行是 - 加一条规则，规则可以带引号。
+  # Clash YAML 名单：payload: 与 - 规则
   if (s ~ /^payload:[ \t]*$/) return
   if (s ~ /^-[ \t]+/) {
     sub(/^-[ \t]+/, "", s)
     s = trim(s)
   }
-  if (length(s) >= 2 && s ~ /^[\047"].*[\047"]$/) s = trim(substr(s, 2, length(s) - 2))
+  if (length(s) >= 2 && ((substr(s, 1, 1) == "\047" && substr(s, length(s), 1) == "\047") \
+      || (substr(s, 1, 1) == "\"" && substr(s, length(s), 1) == "\""))) {
+    s = trim(substr(s, 2, length(s) - 2))
+  }
   if (s == "") return
-  # 全角逗号写成的规则，例如 DOMAIN，example.com
-  if (s ~ /^[A-Za-z0-9_-]+[ \t]*，/) gsub(/[ \t]*，[ \t]*/, ",", s)
+  # 全角逗号、顿号统一转成英文逗号（LC_ALL=C 下不能放进 [...] 字符类，必须按完整字节串替换）
+  gsub(/[ \t]*，[ \t]*/, ",", s)
+  gsub(/[ \t]*、[ \t]*/, ",", s)
+  # dnsmasq 格式：address=/example.com/0.0.0.0
   if (s ~ /^address=\//) {
     split(s, f, "/")
     emit_name("suffix", f[2])
     return
   }
+  # AdBlock / AdGuard 格式：||example.com^
   if (s ~ /^\|\|/) {
     sub(/^\|\|/, "", s)
     sub(/\^.*$/, "", s)
     emit_name("suffix", s)
     return
   }
+  # v2fly / geosite 格式：full:example.com / domain:example.com
+  if (s ~ /^(full|domain|keyword|regexp):/) {
+    sub(/[ \t]+@.*$/, "", s)
+    if (s ~ /^full:/) { emit_name("domain", substr(s, 6)); return }
+    if (s ~ /^domain:/) { emit_name("suffix", substr(s, 8)); return }
+    if (s ~ /^keyword:/) { bad("keyword", s); return }
+    bad("unsupported", s)
+    return
+  }
+  # 逗号分隔：先识别 Clash/Surge 规则，再支持小白用逗号写多个域名/IP
   if (index(s, ",") > 0) {
-    split(s, f, ",")
+    n = split(s, f, ",")
     kind = toupper(trim(f[1]))
     host = trim(f[2])
     if (kind == "DOMAIN" || kind == "HOST") { emit_name("domain", host); return }
@@ -404,12 +503,20 @@ function do_classify(   s, f, kind, host) {
       return
     }
     if (kind == "IP-CIDR" || kind == "IP-CIDR6") { emit_addr(host); return }
-    if (kind ~ /^[A-Z0-9_-]+$/) { bad("unsupported", s); return }
-  }
-  s = strip_url(s)
-  if (substr(s, 1, 1) == "[" && match(s, /^\[[0-9A-Fa-f:]+\]/)) {
-    emit_addr(substr(s, 2, RLENGTH - 2))
-    return
+    if (kind ~ /^[A-Z][A-Z0-9_-]*$/) { bad("unsupported", s); return }
+    all_ok = 1
+    for (i = 1; i <= n; i++) {
+      t = trim(f[i])
+      if (t == "") continue
+      if (!looks_like_target(t)) { all_ok = 0; break }
+    }
+    if (all_ok) {
+      for (i = 1; i <= n; i++) {
+        t = trim(f[i])
+        if (t != "") emit_single_target(t)
+      }
+      return
+    }
   }
   emit_addr_or_name(s)
 }
@@ -478,6 +585,53 @@ function do_overlap(   n, x, kind, val, i) {
   }
   print kind "\t" val
 }
+function do_match(   t, line, n, parts, i, j, cand, dset) {
+  t = trim(target)
+  t = strip_url(t)
+  if (substr(t, 1, 1) == "[" && match(t, /^\[[0-9A-Fa-f:]+\]/)) {
+    t = substr(t, 2, RLENGTH - 2)
+  }
+  if (t ~ /^[0-9.]+:[0-9]+$/) sub(/:[0-9]+$/, "", t)
+  if (index(t, "/") > 0 && !is_ipv4(substr(t, 1, index(t, "/") - 1)) && !is_ipv6(substr(t, 1, index(t, "/") - 1))) {
+    sub(/\/.*$/, "", t)
+  }
+  if (is_ipv4(t)) {
+    while ((getline line < (plan "/v4")) > 0) {
+      if (line != "" && v4_contains(line, t)) { print "v4\t" line; close(plan "/v4"); return }
+    }
+    close(plan "/v4")
+    print "none\t" t
+    return
+  }
+  if (is_ipv6(t)) {
+    t = tolower(t)
+    while ((getline line < (plan "/v6")) > 0) {
+      if (line != "" && v6_contains(line, t)) { print "v6\t" line; close(plan "/v6"); return }
+    }
+    close(plan "/v6")
+    print "none\t" t
+    return
+  }
+  if (t ~ /:[0-9]+$/) sub(/:[0-9]+$/, "", t)
+  t = tolower(t)
+  sub(/^\*\./, "", t)
+  sub(/^\+\./, "", t)
+  sub(/^\./, "", t)
+  sub(/\.$/, "", t)
+  if (!is_domain(t)) { print "invalid\t" target; return }
+  while ((getline line < (plan "/dns.list")) > 0) {
+    if (line != "") dset[line] = 1
+  }
+  close(plan "/dns.list")
+  if (t in dset) { print "domain_exact\t" t; return }
+  n = split(t, parts, ".")
+  for (i = 2; i <= n - 1; i++) {
+    cand = parts[i]
+    for (j = i + 1; j <= n; j++) cand = cand "." parts[j]
+    if (cand in dset) { print "domain_sub\t" cand; return }
+  }
+  print "none\t" t
+}
 function read_one(path,   line) {
   line = ""
   if ((getline line < path) <= 0) line = ""
@@ -499,9 +653,11 @@ function oth_jump() {
 function rule(spec) {
   print "-A " chain " " spec
 }
+function dns_rule(spec) {
+  print "-A " dnschain " " spec
+}
 function emit_match(mspec, mode_s, ports_s,   n, i, p, group, count) {
   if (mode_s == "all") {
-    # TCP 回 reset，对方程序立刻知道连不上，不用干等超时。
     rule(mspec " -p tcp -j " tcp_jump())
     rule(mspec " -j " oth_jump())
     return
@@ -527,7 +683,7 @@ function emit_match(mspec, mode_s, ports_s,   n, i, p, group, count) {
     rule(mspec " -p udp --dport " p[i] " -j " oth_jump())
   }
 }
-function render_rules(   mode_s, ports_s, method, list, setname, addr, line, h, c, opt) {
+function render_rules(   mode_s, ports_s, method, list, setname, addr, line, h, c, opt, has_dns) {
   mode_s = read_one(plan "/mode")
   ports_s = read_one(plan "/ports")
   method = read_one(plan "/dns.method")
@@ -545,19 +701,22 @@ function render_rules(   mode_s, ports_s, method, list, setname, addr, line, h, 
     close(list)
   }
   if (method != "string" || algo == "") return
-  # 拦 53 端口上的域名查询。域名分不了端口，不管封整台机器还是只封某些端口都拦。
-  # 末尾带上 00 结束符：example.com 不会误拦 example.com.cn，子域名照样拦。
-  # --icase 防止大小写混写的查询（0x20 随机大小写）绕过去。
+  # 仅对 53 端口 DNS 流量跳转到独立子链，普通代理流量（如 443）不遍历域名规则，几乎零性能开销。
   opt = " --algo " algo (icase == "1" ? " --icase" : "")
+  has_dns = 0
   while ((getline line < (plan "/dns.list")) > 0) {
     h = wire_hex(line)
     if (h == "" || length(h) > 240) continue
-    rule("-p udp --dport 53 -m string --hex-string |" h "00|" opt " -j " oth_jump())
-    rule("-p tcp --dport 53 -m string --hex-string |" h "00|" opt " -j " tcp_jump())
+    if (!has_dns) {
+      rule("-p udp --dport 53 -j " dnschain)
+      rule("-p tcp --dport 53 -j " dnschain)
+      has_dns = 1
+    }
+    dns_rule("-p udp -m string --hex-string |" h "00|" opt " -j " oth_jump())
+    dns_rule("-p tcp -m string --hex-string |" h "00|" opt " -j " tcp_jump())
   }
   close(plan "/dns.list")
 }
-# 先装进临时集合，外面再和正式集合对调。换的过程中旧集合一直有效。
 function render_ipset(   list, family, n, line, maxe, hs, tmp) {
   list = plan "/v" fam
   family = fam == "6" ? "inet6" : "inet"
@@ -579,7 +738,7 @@ function nft_set(name, type, path,   line, first) {
   print "  set " name " {"
   print "    type " type
   print "    flags interval"
-  print "    auto-merge"
+  if (nft_automerge == "1") print "    auto-merge"
   print "    elements = {"
   first = 1
   while ((getline line < path) > 0) {
@@ -594,14 +753,24 @@ function nft_set(name, type, path,   line, first) {
 }
 function nft_rules(target,   ports) {
   if (mode_s == "all") {
-    print "    " target " meta l4proto tcp reject with tcp reset"
-    print "    " target " reject"
+    if (nft_reject == "1") {
+      print "    " target " meta l4proto tcp reject with tcp reset"
+      print "    " target " reject"
+    } else {
+      print "    " target " drop"
+    }
     return
   }
+  if (ports_s == "") return
   ports = ports_s
   gsub(/,/, ", ", ports)
-  print "    " target " tcp dport { " ports " } reject with tcp reset"
-  print "    " target " udp dport { " ports " } reject"
+  if (nft_reject == "1") {
+    print "    " target " tcp dport { " ports " } reject with tcp reset"
+    print "    " target " udp dport { " ports " } reject"
+  } else {
+    print "    " target " tcp dport { " ports " } drop"
+    print "    " target " udp dport { " ports " } drop"
+  }
 }
 function render_nft(   h4, h6) {
   mode_s = read_one(plan "/mode")
@@ -621,13 +790,17 @@ function render_nft(   h4, h6) {
 BEGIN {
   for (i = 1; i < 128; i++) ord[sprintf("%c", i)] = i
   if (chain == "") chain = "VPS_FENGJIN"
+  if (dnschain == "") dnschain = "VPS_FENGJIN_DNS"
   if (set4 == "") set4 = "vps_fengjin4"
   if (set6 == "") set6 = "vps_fengjin6"
   if (table == "") table = "vpsfengjin"
   if (cap == "") cap = 1500
+  if (nft_reject == "") nft_reject = "1"
+  if (nft_automerge == "") nft_automerge = "1"
   if (mode == "rules") { render_rules(); exit }
   if (mode == "ipset") { render_ipset(); exit }
   if (mode == "nft") { render_nft(); exit }
+  if (mode == "match") { do_match(); exit }
   if (mode == "overlap" && peers != "") {
     while ((getline line < peers) > 0) {
       line = trim(line)
@@ -649,7 +822,6 @@ fengjin_awk() {
   _fa_mode=$1
   shift
   _fa_n=$#
-  # 把 名字=值 变成 awk 的 -v 名字=值
   for _fa_arg in "$@"; do
     set -- "$@" -v "$_fa_arg"
   done
@@ -657,20 +829,45 @@ fengjin_awk() {
   LC_ALL=C awk -v mode="$_fa_mode" "$@" "$FENGJIN_AWK"
 }
 
-# 返回 0 时打印整理好的端口；1 表示写错，2 表示超过 30 个。
+# 返回 0 时输出整理好的端口；1 表示格式错，2 表示超过 30 个。
 parse_ports() {
   printf '%s\n' "$1" | fengjin_awk ports
 }
 
+# GitHub 网页链接自动转 Raw 直链。
+normalize_url() {
+  _nu_u=$1
+  case $_nu_u in
+    https://github.com/*/blob/*|http://github.com/*/blob/*)
+      _nu_rest=${_nu_u#*github.com/}
+      _nu_owner=${_nu_rest%%/*}; _nu_rest=${_nu_rest#*/}
+      _nu_repo=${_nu_rest%%/*}; _nu_rest=${_nu_rest#*/}
+      _nu_rest=${_nu_rest#blob/}
+      _nu_rest=${_nu_rest%%\?*}
+      if [ -n "$_nu_owner" ] && [ -n "$_nu_repo" ] && [ -n "$_nu_rest" ]; then
+        printf 'https://raw.githubusercontent.com/%s/%s/%s\n' "$_nu_owner" "$_nu_repo" "$_nu_rest"
+        return 0
+      fi
+      ;;
+    https://github.com/*/raw/*|http://github.com/*/raw/*)
+      _nu_rest=${_nu_u#*github.com/}
+      _nu_owner=${_nu_rest%%/*}; _nu_rest=${_nu_rest#*/}
+      _nu_repo=${_nu_rest%%/*}; _nu_rest=${_nu_rest#*/}
+      _nu_rest=${_nu_rest#raw/}
+      _nu_rest=${_nu_rest%%\?*}
+      if [ -n "$_nu_owner" ] && [ -n "$_nu_repo" ] && [ -n "$_nu_rest" ]; then
+        printf 'https://raw.githubusercontent.com/%s/%s/%s\n' "$_nu_owner" "$_nu_repo" "$_nu_rest"
+        return 0
+      fi
+      ;;
+  esac
+  printf '%s\n' "$_nu_u"
+}
+
 #----------------------------------------------------------------------
-# 提问。
-# 所有回答都从 3 号描述符读：stdin 是键盘就读 stdin；不是（例如 curl ... | sh）
-# 就读 /dev/tty；连终端都没有（例如自动化脚本 printf '答案' | sh install.sh），
-# 再回到 stdin。提示语写到 stderr，不会混进 $(...) 拿到的结果里。
+# 交互输入封装（所有回答走 fd 3，提示语走 stderr，不污染 $(...)）
 #----------------------------------------------------------------------
 
-# 原来的 stdin 存到 4 号描述符。函数可能在 while ... done <文件 里被调用，
-# 那时的 0 号已经不是原来的 stdin 了。
 save_stdin() {
   [ "${STDIN_SAVED:-0}" = 1 ] && return 0
   STDIN_SAVED=1
@@ -693,15 +890,14 @@ input_init() {
   fi
 }
 
-# ask 提示 [默认值]。结果放在 ANSWER，已去掉首尾空白和 Windows 换行。
+# ask 提示 [默认值]。结果放在 ANSWER。
 ask() {
   input_init
   printf '%s' "$1" >&2
   if ! IFS= read -r ANSWER <&3; then
     printf '\n' >&2
-    die "没有读到输入。不想一问一答的话，可以用参数运行，例如：vps-fengjin -l 名单网址 -y"
+    die "输入已中断。若想直接用参数自动运行，示例：vps-fengjin -l 名单网址 -y"
   fi
-  # 答案不是从键盘来的，就回显一下，日志里能看出每一步选了什么。
   [ "$IN_TTY" = 1 ] || printf '%s\n' "$ANSWER" >&2
   ANSWER=$(printf '%s' "$ANSWER" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   [ -n "$ANSWER" ] || ANSWER=${2:-}
@@ -712,14 +908,14 @@ ask_yn() {
   while :; do
     ask "$1" "$2"
     case $ANSWER in
-      y|Y|yes|Yes|YES|是|好|确认) return 0 ;;
-      n|N|no|No|NO|否|不) return 1 ;;
+      y|Y|yes|Yes|YES|是|好|确定|确认) return 0 ;;
+      n|N|no|No|NO|否|不|取消) return 1 ;;
     esac
-    say_warn "请输入 y 或 n。"
+    say_warn "请输入 y（确认）或 n（取消）。"
   done
 }
 
-# ask_pick 提示 默认 可选值...。ANSWER 一定是可选值之一。
+# ask_pick 提示 默认 可选值...
 ask_pick() {
   _ap_prompt=$1
   _ap_def=$2
@@ -729,12 +925,20 @@ ask_pick() {
     for _ap_c in "$@"; do
       [ "$ANSWER" = "$_ap_c" ] && return 0
     done
-    say_warn "请输入 $(printf '%s ' "$@" | sed 's/ $//;s/ /、/g') 中的一个。"
+    say_warn "请输入选项编号：$(printf '%s ' "$@" | sed 's/ $//;s/ / \/ /g')。"
   done
 }
 
+# 交互终端下暂停，让用户看清结果再刷回菜单。
+pause_enter() {
+  input_init
+  [ "$IN_TTY" = 1 ] || return 0
+  printf '\n%s' "${C_DIM}按回车键继续...${C_NC}" >&2
+  IFS= read -r _pe_dummy <&3 || true
+}
+
 #----------------------------------------------------------------------
-# 系统、内存、软件源
+# 系统、内存、交换空间、软件源
 #----------------------------------------------------------------------
 
 detect_os() {
@@ -768,8 +972,6 @@ mem_total_kb() {
   esac
 }
 
-# 名单上限。真正吃内存的是 dnsmasq 里的域名，每条大约一百字节。
-# 64MB 小鸡放 10 万条，大一些的机器可以吃下整份去广告名单。
 list_limits() {
   LIST_MAX_MB=32
   LIST_MAX_BYTES=$((LIST_MAX_MB * 1048576))
@@ -780,7 +982,6 @@ list_limits() {
   fi
 }
 
-# 没有 ipset 时，地址得一条条写进 iptables，条数一多匹配变慢。按内存给上限。
 no_ipset_rule_cap() {
   _kb=$(mem_total_kb)
   if [ "$_kb" -eq 0 ] || [ "$_kb" -le 131072 ]; then
@@ -792,7 +993,6 @@ no_ipset_rule_cap() {
   fi
 }
 
-# 临时目录尽量放硬盘。很多系统的 /tmp 是内存盘，几 MB 的名单复制几份就能把小鸡挤爆。
 pick_tmpdir() {
   for _d in "${TMPDIR:-}" /var/tmp /root /tmp; do
     [ -n "$_d" ] && [ -d "$_d" ] && [ -w "$_d" ] || continue
@@ -809,7 +1009,7 @@ pick_tmpdir() {
 lowmem_prepare() {
   _kb=$(mem_total_kb)
   [ "$_kb" -gt 0 ] && [ "$_kb" -le 196608 ] || return 0
-  say_info "内存大约 $((_kb / 1024)) MB。按小鸡处理：允许内存超卖，磁盘够的话加 64MB 交换。"
+  say_info "检测到小内存机器（约 $((_kb / 1024)) MB），自动优化内存策略..."
   sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
   if awk 'NR > 1 { found = 1 } END { exit found ? 0 : 1 }' /proc/swaps 2>/dev/null; then
     return 0
@@ -819,9 +1019,7 @@ lowmem_prepare() {
     ''|*[!0-9]*) _free=0 ;;
   esac
   if [ "$_free" -ge 180000 ]; then
-    make_swap || say_warn "交换空间没加上，继续。名单特别大时可能会紧。"
-  else
-    say_warn "磁盘剩余不多，不加交换空间。"
+    make_swap || say_warn "未能开启交换空间（受限容器里常见），将继续运行。"
   fi
 }
 
@@ -832,10 +1030,11 @@ make_swap() {
     swapon "$_f" 2>/dev/null && return 0
     rm -f "$_f"
   fi
-  if ! { command -v fallocate >/dev/null 2>&1 && fallocate -l 64M "$_f" 2>/dev/null; }; then
-    dd if=/dev/zero of="$_f" bs=1048576 count=64 >/dev/null 2>&1 || { rm -f "$_f"; return 1; }
+  # 用 dd 分配连续块，避免部分文件系统上 fallocate 建出的文件 swapon 失败。
+  if ! dd if=/dev/zero of="$_f" bs=1048576 count=64 >/dev/null 2>&1; then
+    rm -f "$_f"
+    return 1
   fi
-  # 容器里常常不让开交换。失败就把文件删掉，别在小硬盘上留 64MB 垃圾。
   if ! chmod 600 "$_f" || ! mkswap "$_f" >/dev/null 2>&1 || ! swapon "$_f" 2>/dev/null; then
     rm -f "$_f"
     return 1
@@ -843,17 +1042,16 @@ make_swap() {
   if ! grep -q "$_f" /etc/fstab 2>/dev/null; then
     printf '%s none swap sw 0 0\n' "$_f" >>/etc/fstab
   fi
-  say_ok "已加上 64MB 交换空间"
+  say_ok "已自动增加 64MB 交换空间"
 }
 
-# 安装输出写进 pm.log，装失败时给用户看最后几行，不再一声不吭。
 pm_install() {
   _pm_log=${WORKDIR:-/tmp}/pm.log
   case ${PM:-none} in
     apt)
       export DEBIAN_FRONTEND=noninteractive
       if [ "${APT_UPDATED:-0}" != 1 ]; then
-        apt-get update -qq >>"$_pm_log" 2>&1 || say_warn "软件源没有完全更新，仍尝试安装。"
+        apt-get update -qq >>"$_pm_log" 2>&1 || say_warn "软件源更新未完全成功，仍尝试继续安装。"
         APT_UPDATED=1
       fi
       apt-get install -y -qq --no-install-recommends \
@@ -868,7 +1066,7 @@ pm_install() {
     zypper) zypper --non-interactive -q install "$1" >>"$_pm_log" 2>&1 ;;
     opkg)
       if [ "${OPKG_UPDATED:-0}" != 1 ]; then
-        opkg update >>"$_pm_log" 2>&1 || say_warn "opkg 源更新失败，仍尝试安装。"
+        opkg update >>"$_pm_log" 2>&1 || say_warn "opkg 源更新失败，仍尝试继续安装。"
         OPKG_UPDATED=1
       fi
       opkg install "$1" >>"$_pm_log" 2>&1
@@ -877,29 +1075,29 @@ pm_install() {
   esac
 }
 
-# need_cmd 命令 软件包...：缺命令时按顺序试装这些包，装上一个就停。
 need_cmd() {
   _nc_cmd=$1
   shift
   command -v "$_nc_cmd" >/dev/null 2>&1 && return 0
+  [ "${PM:-none}" != none ] || return 1
   for _nc_pkg in "$@"; do
-    say_info "缺少 $_nc_cmd，尝试安装 $_nc_pkg"
+    say_dim "  正在自动安装依赖：$_nc_pkg ..."
     : >"${WORKDIR:-/tmp}/pm.log"
     if pm_install "$_nc_pkg" && command -v "$_nc_cmd" >/dev/null 2>&1; then
-      say_ok "已装上 $_nc_pkg"
       return 0
     fi
   done
-  say_warn "$_nc_cmd 没装上。安装输出的最后几行："
-  tail -n 3 "${WORKDIR:-/tmp}/pm.log" 2>/dev/null | sed 's/^/    /'
+  say_warn "依赖 $_nc_cmd 自动安装失败。"
+  if [ -s "${WORKDIR:-/tmp}/pm.log" ]; then
+    tail -n 3 "${WORKDIR:-/tmp}/pm.log" 2>/dev/null | sed 's/^/    /'
+  fi
   return 1
 }
 
 #----------------------------------------------------------------------
-# 防火墙探测。只拦本机发出去的连接（OUTPUT）。代理程序替用户连出去，也算本机发出。
+# 防火墙探测与写入（仅控制本机出站 OUTPUT，含代理节点转发出去的连接）
 #----------------------------------------------------------------------
 
-# ipt_try 程序 规则...：在测试链里试加一条规则，返回能不能加上。
 ipt_try() {
   _it_bin=$1
   shift
@@ -909,8 +1107,6 @@ ipt_try() {
   return $_it_rc
 }
 
-# 一个协议族可以用的 iptables 命令，按顺序试。
-# NAT 小鸡上常见：默认的 iptables 是 nft 版，内核或容器不支持，旧版 iptables-legacy 却能用。
 ipt_candidates() {
   if [ "$1" = 6 ]; then
     printf '%s\n' ip6tables ip6tables-legacy ip6tables-nft
@@ -919,8 +1115,6 @@ ipt_candidates() {
   fi
 }
 
-# 探测一个协议族的 iptables 能力，结果放在 P_ 开头的变量里。P_BIN 是能用的命令。
-# IPv4 和 IPv6 分开探：有的机器 ip6tables 缺模块，不能拿 IPv4 的结果套用。
 probe_ipt_family() {
   _pf_fam=inet
   [ "$1" = 6 ] && _pf_fam=inet6
@@ -941,7 +1135,6 @@ probe_ipt_family() {
       P_BIN=$_pf_bin
       break
     fi
-    # 记下报错，都用不了时给用户看。
     [ "$1" = 4 ] && printf '%s：%s\n' "$_pf_bin" "$(head -n 1 "$WORKDIR/ipt.err")" >>"$WORKDIR/fw.err"
   done
   [ -n "$P_BIN" ] || return 0
@@ -967,12 +1160,55 @@ probe_ipt_family() {
   "$P_BIN" -X VPS_FENGJIN_T >/dev/null 2>&1
 }
 
-# 有没有改防火墙的权限（CAP_NET_ADMIN）。商家没给这个权限的容器，root 也改不了。
-# 看不出来时当作有，交给后面实际试。
+# 真正探测 nft 建表、挂 output 钩子、auto-merge 与 reject 能力。
+probe_nft() {
+  NFT_REJECT=0
+  NFT_AUTOMERGE=0
+  command -v nft >/dev/null 2>&1 || return 1
+  nft delete table inet vpsfengjin_t >/dev/null 2>&1
+  nft delete table inet vpsfengjin_t2 >/dev/null 2>&1
+  if ! nft -f - >/dev/null 2>"$WORKDIR/nft.err" <<'EOF'
+table inet vpsfengjin_t {
+  set s4 {
+    type ipv4_addr
+    flags interval
+    elements = { 192.0.2.1 }
+  }
+  chain out {
+    type filter hook output priority -50; policy accept;
+    ip daddr @s4 drop
+  }
+}
+EOF
+  then
+    printf 'nft：%s\n' "$(head -n 1 "$WORKDIR/nft.err")" >>"$WORKDIR/fw.err"
+    return 1
+  fi
+  if nft -f - >/dev/null 2>&1 <<'EOF'
+table inet vpsfengjin_t2 {
+  set s4 {
+    type ipv4_addr
+    flags interval
+    auto-merge
+    elements = { 192.0.2.1, 192.0.2.0/24 }
+  }
+}
+EOF
+  then
+    NFT_AUTOMERGE=1
+    nft delete table inet vpsfengjin_t2 >/dev/null 2>&1
+  fi
+  if nft add rule inet vpsfengjin_t out ip daddr @s4 meta l4proto tcp reject with tcp reset >/dev/null 2>&1 \
+    && nft add rule inet vpsfengjin_t out ip daddr @s4 reject >/dev/null 2>&1; then
+    NFT_REJECT=1
+  fi
+  nft delete table inet vpsfengjin_t >/dev/null 2>&1
+  return 0
+}
+
 has_net_admin() {
   _hn_cap=$(awk '/^CapEff:/ { print $2; exit }' /proc/self/status 2>/dev/null)
   [ -n "$_hn_cap" ] || return 0
-  # CAP_NET_ADMIN 是第 12 位，在倒数第 4 个十六进制数字里。
   case $(printf '%s' "$_hn_cap" | awk '{ print substr($0, length($0) - 3, 1) }') in
     [13579bBdDfF]) return 0 ;;
   esac
@@ -984,6 +1220,8 @@ probe_firewall() {
   PROBED=1
   : >"$WORKDIR/fw.err"
   FW_BACKEND=none
+  NFT_REJECT=0
+  NFT_AUTOMERGE=0
   for _fam in 4 6; do
     for _v in OK SET STRING MULTI REJECT RESET ICASE; do
       eval "V${_fam}_$_v=0"
@@ -992,7 +1230,7 @@ probe_firewall() {
   done
   has_net_admin || return 0
   for _m in ip_tables iptable_filter ip6_tables ip6table_filter ip_set ip_set_hash_net \
-    xt_set xt_string xt_multiport nf_tables; do
+    xt_set xt_string xt_multiport nf_tables nft_reject_inet; do
     modprobe "$_m" >/dev/null 2>&1
   done
   for _fam in 4 6; do
@@ -1003,32 +1241,11 @@ probe_firewall() {
   done
   if [ "$V4_OK" = 1 ]; then
     FW_BACKEND=iptables
-  elif command -v nft >/dev/null 2>&1; then
-    if nft add table inet vpsfengjin_t >/dev/null 2>"$WORKDIR/nft.err" \
-      && nft delete table inet vpsfengjin_t >/dev/null 2>&1; then
-      FW_BACKEND=nft
-    else
-      printf 'nft：%s\n' "$(head -n 1 "$WORKDIR/nft.err")" >>"$WORKDIR/fw.err"
-    fi
+  elif probe_nft; then
+    FW_BACKEND=nft
   fi
 }
 
-# 防火墙用不了时，用大白话说清楚原因和影响。
-fw_explain() {
-  say_warn "这台机器改不了防火墙，改为“只拦域名”。"
-  if ! has_net_admin; then
-    say "  原因：这台机器是容器，商家没有给它改防火墙的权限（NET_ADMIN），root 也改不了。"
-  else
-    say "  原因：防火墙命令都报错："
-    sed 's/^/    /' "$WORKDIR/fw.err"
-  fi
-  say "  只拦域名的效果：这台机器（包括你搭的节点）查不到名单里的域名，也就打不开这些网站和 App。"
-  say "  做不到的：名单里的 IP / 网段封不了；节点程序如果自己指定了别的 DNS，可能拦不住。"
-  say "  想全部封住，可以请商家开通 iptables（NET_ADMIN）权限，开好后再运行一次脚本。"
-}
-
-# 设置前先看这台机器能不能改防火墙。缺 iptables / ipset 先试着装，
-# 实在不行再用 nftables；都不行就只拦域名（FW_BACKEND=none）。
 fw_precheck() {
   [ "${FW_CHECKED:-0}" = 1 ] && return 0
   FW_CHECKED=1
@@ -1037,7 +1254,6 @@ fw_precheck() {
     command -v iptables >/dev/null 2>&1 || need_cmd iptables iptables || true
     command -v ipset >/dev/null 2>&1 || need_cmd ipset ipset || true
     probe_firewall
-    # Alpine 3.19 起 iptables 默认是 nft 版，旧版接口要单独装。
     if [ "$V4_OK" != 1 ] && [ "${PM:-none}" = apk ] && ! command -v iptables-legacy >/dev/null 2>&1; then
       need_cmd iptables-legacy iptables-legacy || true
       PROBED=0
@@ -1051,14 +1267,27 @@ fw_precheck() {
   else
     probe_firewall
   fi
+}
+
+fw_summary_line() {
   case $FW_BACKEND in
-    none) fw_explain ;;
-    nft) say_ok "防火墙：nftables" ;;
+    none)
+      say_warn "环境受限：这台机器没有修改防火墙权限，已自动切换为「仅封禁域名」模式。"
+      if ! has_net_admin; then
+        say_dim "  说明：常见于 LXC/Docker 等受限容器（未开启 NET_ADMIN）。域名照常可封，IP/网段会跳过。"
+      else
+        say_dim "  说明：系统防火墙不可用，域名照常可封，IP/网段会跳过。"
+      fi
+      ;;
+    nft)
+      say_ok "环境就绪：域名与 IP/网段均可完整封禁（防火墙：nftables）"
+      ;;
     *)
       if [ "$V4_SET" = 1 ]; then
-        say_ok "防火墙：$V4_BIN + ipset"
+        say_ok "环境就绪：域名与 IP/网段均可完整封禁（防火墙：$V4_BIN + ipset）"
       else
-        say_warn "有 $V4_BIN，但 ipset 用不了（常见于部分 NAT 小鸡）。地址只能一条条写进规则，最多写 $(no_ipset_rule_cap) 条，超出的不拦。"
+        say_ok "环境就绪：域名与 IP/网段均可封禁（防火墙：${V4_BIN}）"
+        say_dim "  提示：当前机器不支持 ipset，IP/网段最多生效 $(no_ipset_rule_cap) 条，域名不受此限制。"
       fi
       ;;
   esac
@@ -1070,12 +1299,6 @@ ipv6_on() {
   return 0
 }
 
-#----------------------------------------------------------------------
-# 写防火墙。都是整体替换：新规则准备好再一次换上，换的过程中旧规则一直有效；
-# 新规则加不上时，旧规则原样留着，不会出现一条都不拦的空档。
-#----------------------------------------------------------------------
-
-# legacy 和 nft 两套规则表是分开的，每种命令都清一遍。
 remove_ipt_family() {
   for _rf_bin in $(ipt_candidates "$1"); do
     command -v "$_rf_bin" >/dev/null 2>&1 || continue
@@ -1083,6 +1306,8 @@ remove_ipt_family() {
       "$_rf_bin" -D OUTPUT -j "$CHAIN" >/dev/null 2>&1 || break
     done
     "$_rf_bin" -F "$CHAIN" >/dev/null 2>&1
+    "$_rf_bin" -F "$DNS_CHAIN" >/dev/null 2>&1
+    "$_rf_bin" -X "$DNS_CHAIN" >/dev/null 2>&1
     "$_rf_bin" -X "$CHAIN" >/dev/null 2>&1
   done
   return 0
@@ -1110,20 +1335,20 @@ remove_firewall() {
   remove_nft
 }
 
-# load_set 4|6：地址装进临时集合，再和正式集合对调。
 load_set() {
   if [ "$1" = 6 ]; then _ls_name=$SET6; else _ls_name=$SET4; fi
+  [ -s "$CFG/v$1" ] || return 0
   ipset destroy "${_ls_name}_n" >/dev/null 2>&1
-  fengjin_awk ipset plan="$CFG" fam="$1" setname="$_ls_name" >"$WORKDIR/set$1" || return 0
+  fengjin_awk ipset plan="$CFG" fam="$1" setname="$_ls_name" >"$WORKDIR/set$1" || return 1
   if ! ipset restore <"$WORKDIR/set$1"; then
     ipset destroy "${_ls_name}_n" >/dev/null 2>&1
-    say_err "IPv$1 地址集没有写进去。"
+    say_err "IPv$1 地址集写入失败。"
     return 1
   fi
   if ! ipset swap "${_ls_name}_n" "$_ls_name" >/dev/null 2>&1; then
     ipset rename "${_ls_name}_n" "$_ls_name" >/dev/null 2>&1 || {
       ipset destroy "${_ls_name}_n" >/dev/null 2>&1
-      say_err "IPv$1 地址集换不上去。"
+      say_err "IPv$1 地址集切换失败。"
       return 1
     }
   fi
@@ -1131,7 +1356,6 @@ load_set() {
   return 0
 }
 
-# apply_ipt_family 4|6
 apply_ipt_family() {
   _af=$1
   eval "_af_bin=\$V${_af}_BIN _af_ok=\$V${_af}_OK _af_set=\$V${_af}_SET _af_multi=\$V${_af}_MULTI _af_rst=\$V${_af}_RESET"
@@ -1148,34 +1372,46 @@ apply_ipt_family() {
   _af_rules=$WORKDIR/rules$_af
   fengjin_awk rules plan="$CFG" fam="$_af" multiport="$_af_multi" algo="$_af_algo" icase="$_af_icase" \
     rtcp="$_af_rtcp" roth="$_af_roth" useset="$_af_set" cap="$(no_ipset_rule_cap)" \
-    chain="$CHAIN" set4="$SET4" set6="$SET6" >"$_af_rules"
+    chain="$CHAIN" dnschain="$DNS_CHAIN" set4="$SET4" set6="$SET6" >"$_af_rules"
   if [ ! -s "$_af_rules" ]; then
     remove_ipt_family "$_af"
     return 0
   fi
+  _af_has_dns=0
+  grep -q -- "-j $DNS_CHAIN" "$_af_rules" && _af_has_dns=1
   if command -v "$_af_bin-restore" >/dev/null 2>&1; then
-    # --noflush 只清空并重写这一条链，别的防火墙规则不动；整个文件一次生效。
     {
       printf '*filter\n:%s - [0:0]\n' "$CHAIN"
+      [ "$_af_has_dns" = 1 ] && printf ':%s - [0:0]\n' "$DNS_CHAIN"
       cat "$_af_rules"
       printf 'COMMIT\n'
     } >"$_af_rules.restore"
     if ! "$_af_bin-restore" --noflush <"$_af_rules.restore"; then
-      say_err "IPv$_af 规则没有加上，原来的规则保持不变。"
+      say_err "IPv$_af 防火墙规则写入失败，原规则保持不变。"
       return 1
     fi
+    if [ "$_af_has_dns" = 0 ]; then
+      "$_af_bin" -F "$DNS_CHAIN" >/dev/null 2>&1
+      "$_af_bin" -X "$DNS_CHAIN" >/dev/null 2>&1
+    fi
   else
-    # 没有 iptables-restore 的极简系统：只能一条条加。
     "$_af_bin" -N "$CHAIN" >/dev/null 2>&1
     "$_af_bin" -F "$CHAIN" >/dev/null 2>&1
+    if [ "$_af_has_dns" = 1 ]; then
+      "$_af_bin" -N "$DNS_CHAIN" >/dev/null 2>&1
+      "$_af_bin" -F "$DNS_CHAIN" >/dev/null 2>&1
+    else
+      "$_af_bin" -F "$DNS_CHAIN" >/dev/null 2>&1
+      "$_af_bin" -X "$DNS_CHAIN" >/dev/null 2>&1
+    fi
     set -f
     while IFS= read -r _af_rule; do
-      # 规则里没有空格以外的特殊字符，按空格拆开正好是 iptables 的参数。
       # shellcheck disable=SC2086
       if ! "$_af_bin" $_af_rule; then
         set +f
         "$_af_bin" -F "$CHAIN" >/dev/null 2>&1
-        say_err "规则没有加上：$_af_rule"
+        "$_af_bin" -F "$DNS_CHAIN" >/dev/null 2>&1
+        say_err "防火墙规则写入失败：$_af_rule"
         return 1
       fi
     done <"$_af_rules"
@@ -1187,7 +1423,6 @@ apply_ipt_family() {
   return 0
 }
 
-# apply_firewall
 apply_firewall() {
   probe_firewall
   _fw_do6=0
@@ -1198,18 +1433,28 @@ apply_firewall() {
       if [ "$V4_SET" = 1 ]; then
         load_set 4 || return 1
       elif [ "$(count_lines "$CFG/v4")" -gt "$(no_ipset_rule_cap)" ]; then
-        say_warn "没有 ipset，IPv4 只封前 $(no_ipset_rule_cap) 条地址，后面的不拦。"
+        say_warn "当前无 ipset，IPv4 地址仅写入前 $(no_ipset_rule_cap) 条。"
       fi
-      if [ "$_fw_do6" = 1 ] && [ "$V6_SET" = 1 ]; then
-        load_set 6 || return 1
+      if [ "$_fw_do6" = 1 ]; then
+        if [ "$V6_SET" = 1 ]; then
+          load_set 6 || return 1
+        elif [ "$(count_lines "$CFG/v6")" -gt "$(no_ipset_rule_cap)" ]; then
+          say_warn "当前无 ipset，IPv6 地址仅写入前 $(no_ipset_rule_cap) 条。"
+        fi
       fi
       apply_ipt_family 4 || return 1
+      if [ -s "$WORKDIR/rules4" ]; then printf '%s\n' 1 >"$CFG/v4.active"; else printf '%s\n' 0 >"$CFG/v4.active"; fi
       if [ "$_fw_do6" = 1 ]; then
         apply_ipt_family 6 || return 1
+        if [ "$V6_OK" = 1 ] && [ -s "$WORKDIR/rules6" ]; then
+          printf '%s\n' 1 >"$CFG/v6.active"
+        else
+          printf '%s\n' 0 >"$CFG/v6.active"
+        fi
       else
         remove_ipt_family 6
+        printf '%s\n' 0 >"$CFG/v6.active"
       fi
-      # 名单里已经没有的那一类地址，集合也不用留着。还被规则引用时删不掉，不要紧。
       [ -s "$CFG/v4" ] && [ "$V4_SET" = 1 ] || remove_sets "$SET4"
       [ -s "$CFG/v6" ] && [ "$V6_SET" = 1 ] && [ "$_fw_do6" = 1 ] || remove_sets "$SET6"
       ;;
@@ -1217,57 +1462,115 @@ apply_firewall() {
       remove_ipt_family 4
       remove_ipt_family 6
       remove_sets "$SET4" "$SET6"
-      # 先建空表再删，再整张表重建，三步在同一个事务里，一起生效。
       {
         printf 'table inet %s\n' "$NFT_TABLE"
         printf 'delete table inet %s\n' "$NFT_TABLE"
-        fengjin_awk nft plan="$CFG" table="$NFT_TABLE"
+        fengjin_awk nft plan="$CFG" table="$NFT_TABLE" \
+          nft_reject="$NFT_REJECT" nft_automerge="$NFT_AUTOMERGE"
       } >"$WORKDIR/rules.nft"
       if ! nft -f "$WORKDIR/rules.nft"; then
-        say_err "nft 规则没有加上，原来的规则保持不变。"
+        say_err "nftables 规则写入失败，原规则保持不变。"
         return 1
       fi
       ;;
     *)
-      say_err "现在用不了防火墙，规则没生效。"
+      say_err "当前机器无法写入防火墙规则。"
       return 1
       ;;
   esac
   return 0
 }
 
-# 规则还在不在。被别的防火墙（firewalld、ufw 重载）清掉时，status 会提示。
+ipt_chain_live() {
+  for _rl_bin in $(ipt_candidates "$1"); do
+    command -v "$_rl_bin" >/dev/null 2>&1 || continue
+    "$_rl_bin" -C OUTPUT -j "$CHAIN" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
 rules_live() {
   case $(cat "$CFG/backend" 2>/dev/null) in
     none)
-      # 只拦域名：看 dnsmasq 还在不在、hosts 里的记录还在不在。
-      case $(cat "$CFG/dns.method" 2>/dev/null) in
-        dnsmasq) dnsmasq_up ;;
-        *) grep -q '^# BEGIN vps-fengjin$' /etc/hosts 2>/dev/null ;;
-      esac
+      dns_live
       ;;
-    nft) nft list table inet "$NFT_TABLE" >/dev/null 2>&1 ;;
+    nft)
+      nft list table inet "$NFT_TABLE" >/dev/null 2>&1
+      ;;
     *)
-      for _rl_bin in $(ipt_candidates 4) $(ipt_candidates 6); do
-        "$_rl_bin" -C OUTPUT -j "$CHAIN" >/dev/null 2>&1 && return 0
-      done
-      return 1
+      _rl_need4=$(cat "$CFG/v4.active" 2>/dev/null)
+      _rl_need6=$(cat "$CFG/v6.active" 2>/dev/null)
+      if [ -z "$_rl_need4" ] && [ -z "$_rl_need6" ]; then
+        # 兼容旧版本升级前未写入 v4.active / v6.active 的情况
+        _rl_method=$(cat "$CFG/dns.method" 2>/dev/null)
+        if [ -s "$CFG/v4" ] || [ "$_rl_method" = string ]; then _rl_need4=1; fi
+      fi
+      if [ "$_rl_need4" = 1 ]; then
+        ipt_chain_live 4 || return 1
+      fi
+      if [ "$_rl_need6" = 1 ]; then
+        ipt_chain_live 6 || return 1
+      fi
+      return 0
       ;;
   esac
 }
 
 #----------------------------------------------------------------------
-# 域名：只在 DNS 这一层拦（拦查询 / dnsmasq / hosts），不封解析到的 IP。
-# 端口范围只对名单里直接写的 IP / 网段起作用，域名在所有端口上都拦。
+# 域名拦截（DNS 查询拦截 / dnsmasq / hosts）
 #----------------------------------------------------------------------
 
-# dnsmasq / hosts 方式的域名拦截还在不在。string 方式走防火墙规则，不用单独看。
+dnsmasq_pids() {
+  if command -v pidof >/dev/null 2>&1; then
+    pidof dnsmasq 2>/dev/null
+    return $?
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x dnsmasq 2>/dev/null
+    return $?
+  fi
+  _dp_found=""
+  for _dp_p in /proc/[0-9]*/comm; do
+    [ -r "$_dp_p" ] || continue
+    if [ "$(cat "$_dp_p" 2>/dev/null)" = dnsmasq ]; then
+      _dp_id=${_dp_p#/proc/}
+      _dp_id=${_dp_id%/comm}
+      _dp_found="$_dp_found $_dp_id"
+    fi
+  done
+  [ -n "$_dp_found" ] || return 1
+  printf '%s\n' "${_dp_found# }"
+}
+
+dnsmasq_up() {
+  dnsmasq_pids >/dev/null 2>&1
+}
+
 dns_live() {
   case $(cat "$CFG/dns.method" 2>/dev/null) in
-    dnsmasq) dnsmasq_up ;;
-    hosts) grep -q '^# BEGIN vps-fengjin$' /etc/hosts 2>/dev/null ;;
+    dnsmasq)
+      dnsmasq_up || return 1
+      if [ -f "$CFG/dnsmasq.owned" ]; then
+        grep -Eq '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.1([[:space:]]|$)' /etc/resolv.conf 2>/dev/null || return 1
+      fi
+      return 0
+      ;;
+    hosts)
+      grep -q '^# BEGIN vps-fengjin$' /etc/hosts 2>/dev/null
+      ;;
     *) return 0 ;;
   esac
+}
+
+flush_dns_cache() {
+  if command -v resolvectl >/dev/null 2>&1; then
+    resolvectl flush-caches >/dev/null 2>&1 || true
+  elif command -v systemd-resolve >/dev/null 2>&1; then
+    systemd-resolve --flush-caches >/dev/null 2>&1 || true
+  fi
+  if command -v nscd >/dev/null 2>&1 && [ -S /var/run/nscd/socket ]; then
+    nscd -i hosts >/dev/null 2>&1 || true
+  fi
 }
 
 strip_marked_file() {
@@ -1289,7 +1592,7 @@ hosts_apply() {
   [ -s "$CFG/dns.list" ] || { hosts_clear; return 0; }
   _ha_n=$(count_lines "$CFG/dns.list")
   if [ "$_ha_n" -gt 2000 ]; then
-    say_warn "/etc/hosts 只写入前 2000 个域名，太多会拖慢这台机器。"
+    say_warn "/etc/hosts 模式仅写入前 2000 个域名，过多会拖慢系统。"
   fi
   {
     if [ -f /etc/hosts ]; then
@@ -1300,81 +1603,47 @@ hosts_apply() {
       ' /etc/hosts
     fi
     printf '%s\n' "# BEGIN vps-fengjin"
-    head -n 2000 "$CFG/dns.list" | awk 'NF { print "0.0.0.0 " $1; print ":: " $1 }'
+    head -n 2000 "$CFG/dns.list" | awk '
+      NF { d = $1; seen[d] = 1; list[++n] = d }
+      END {
+        for (i = 1; i <= n; i++) {
+          d = list[i]
+          print "0.0.0.0 " d
+          print ":: " d
+          # 若未写 www.，顺带补上 www.，减少 /etc/hosts 漏拦主站的尴尬
+          if (n <= 1000 && d !~ /^www\./ && !(("www." d) in seen)) {
+            print "0.0.0.0 www." d
+            print ":: www." d
+          }
+        }
+      }
+    '
     printf '%s\n' "# END vps-fengjin"
   } >"$WORKDIR/hosts.new"
-  # 内容没变就不写，定时刷新时不反复改文件。
   cmp -s "$WORKDIR/hosts.new" /etc/hosts 2>/dev/null && return 0
   if ! cat "$WORKDIR/hosts.new" 2>/dev/null >/etc/hosts; then
-    say_err "/etc/hosts 改不了（只读），域名拦不住。"
+    say_err "/etc/hosts 为只读文件，无法写入域名规则。"
     return 1
   fi
 }
 
-# 两种情况：
-#   本来就在跑的 dnsmasq（OpenWrt 路由、别的程序装的）：只追加拦截的域名，
-#     不碰它的监听地址和上游，否则会把局域网的 DNS 弄坏。
-#   脚本自己装、自己拉起来的：记在 dnsmasq.owned，只听 127.0.0.1。
-#     关闭时连服务一起停掉，免得重启后按默认配置对外开放 53 端口。
-dnsmasq_clear() {
-  _dc_changed=0
-  if [ -f /etc/dnsmasq.d/vps-fengjin.conf ]; then
-    rm -f /etc/dnsmasq.d/vps-fengjin.conf
-    _dc_changed=1
-  fi
-  if grep -q '^# BEGIN vps-fengjin$' /etc/dnsmasq.conf 2>/dev/null; then
-    strip_marked_file /etc/dnsmasq.conf
-    _dc_changed=1
-  fi
-  if grep -q 'vps-fengjin managed' /etc/resolv.conf 2>/dev/null && [ -f "$CFG/resolv.conf.bak" ]; then
-    cat "$CFG/resolv.conf.bak" >/etc/resolv.conf
-  fi
-  if [ -f "$CFG/dnsmasq.owned" ]; then
-    stop_dnsmasq
-    rm -f "$CFG/dnsmasq.owned"
-  elif [ "$_dc_changed" = 1 ] && pidof dnsmasq >/dev/null 2>&1; then
-    restart_dnsmasq || true
-  fi
-  return 0
-}
-
-write_dnsmasq_conf() {
-  {
-    if [ "$2" = 1 ]; then
-      printf '%s\n' "listen-address=127.0.0.1" "bind-interfaces" "no-resolv" "no-hosts" \
-        "cache-size=1000" "domain-needed"
-      if [ -s "$CFG/upstream.dns" ]; then
-        awk 'NF { print "server=" $1 }' "$CFG/upstream.dns"
-      else
-        printf '%s\n' "server=1.1.1.1" "server=8.8.8.8"
-      fi
-    fi
-    # 不写地址的 address=/域名/ 对 IPv4、IPv6 都回“不存在”，子域名一起拦。
-    awk 'NF { print "address=/" $1 "/" }' "$CFG/dns.list"
-  } >"$1"
-}
-
-# dnsmasq.conf 里有没有真正生效的 conf-dir。Debian 系的启动脚本自己会带上 /etc/dnsmasq.d。
-dnsmasq_reads_confdir() {
-  grep -q '^CONFIG_DIR=/etc/dnsmasq.d' /etc/default/dnsmasq 2>/dev/null && return 0
-  grep -E -q '^[[:space:]]*conf-dir=/etc/dnsmasq\.d' /etc/dnsmasq.conf 2>/dev/null
-}
-
-dnsmasq_up() {
-  pidof dnsmasq >/dev/null 2>&1
-}
-
 kill_dnsmasq() {
-  _kd_pids=$(pidof dnsmasq 2>/dev/null)
+  _kd_pids=$(dnsmasq_pids 2>/dev/null)
   [ -n "$_kd_pids" ] || return 0
   # shellcheck disable=SC2086
   kill $_kd_pids >/dev/null 2>&1
   sleep 1
 }
 
-# 每种启动方式试过都看一眼 dnsmasq 真的在跑没有。
-# 容器里没有 systemd，也没有在跑的 openrc，服务命令可能“成功”却什么都没启动，
-# 最后直接运行 dnsmasq（它自己会转到后台）。
+dnsmasq_reads_confdir() {
+  # Debian/Ubuntu 的 /etc/init.d/dnsmasq 自带 /etc/dnsmasq.d（即使 /etc/default/dnsmasq 里被注释），不可重复追加。
+  if [ -f /etc/default/dnsmasq ] && grep -q '/etc/dnsmasq\.d' /etc/init.d/dnsmasq 2>/dev/null; then
+    return 0
+  fi
+  grep -q '^CONFIG_DIR=/etc/dnsmasq\.d' /etc/default/dnsmasq 2>/dev/null && return 0
+  grep -Eq '^[[:space:]]*conf-dir=/etc/dnsmasq\.d' /etc/dnsmasq.conf 2>/dev/null
+}
+
 restart_dnsmasq() {
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemctl enable dnsmasq >/dev/null 2>&1
@@ -1389,7 +1658,11 @@ restart_dnsmasq() {
   fi
   kill_dnsmasq
   command -v dnsmasq >/dev/null 2>&1 || return 1
-  dnsmasq >/dev/null 2>&1
+  if [ -f "$CFG/dnsmasq.owned" ] && [ -f /etc/dnsmasq.d/vps-fengjin.conf ]; then
+    dnsmasq --conf-file=/etc/dnsmasq.d/vps-fengjin.conf >/dev/null 2>&1
+  else
+    dnsmasq >/dev/null 2>&1
+  fi
   sleep 1
   dnsmasq_up
 }
@@ -1407,21 +1680,80 @@ stop_dnsmasq() {
   return 0
 }
 
+dnsmasq_clear() {
+  _dc_changed=0
+  if [ -f /etc/dnsmasq.d/vps-fengjin.conf ]; then
+    rm -f /etc/dnsmasq.d/vps-fengjin.conf
+    _dc_changed=1
+  fi
+  if grep -q '^# BEGIN vps-fengjin$' /etc/dnsmasq.conf 2>/dev/null; then
+    strip_marked_file /etc/dnsmasq.conf
+    _dc_changed=1
+  fi
+  if [ -f "$CFG/dnsmasq.confdir" ] && [ -f /etc/dnsmasq.conf ]; then
+    grep -vxF 'conf-dir=/etc/dnsmasq.d/,*.conf' /etc/dnsmasq.conf >"$WORKDIR/dnsmasq.conf.new"
+    cat "$WORKDIR/dnsmasq.conf.new" >/etc/dnsmasq.conf
+    rm -f "$CFG/dnsmasq.confdir"
+    _dc_changed=1
+  fi
+  if grep -q 'vps-fengjin managed' /etc/resolv.conf 2>/dev/null; then
+    if [ -f "$CFG/resolv.conf.link" ]; then
+      _dc_link=$(cat "$CFG/resolv.conf.link" 2>/dev/null)
+      [ -n "$_dc_link" ] && ln -sf "$_dc_link" /etc/resolv.conf 2>/dev/null || true
+      rm -f "$CFG/resolv.conf.link"
+    elif [ -f "$CFG/resolv.conf.bak" ]; then
+      cat "$CFG/resolv.conf.bak" >/etc/resolv.conf 2>/dev/null || true
+    fi
+  fi
+  if [ -f "$CFG/dnsmasq.owned" ]; then
+    stop_dnsmasq
+    rm -f "$CFG/dnsmasq.owned"
+  elif [ "$_dc_changed" = 1 ] && dnsmasq_up; then
+    restart_dnsmasq || true
+  fi
+  if [ -f "$CFG/resolved.was_active" ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
+    fi
+    rm -f "$CFG/resolved.was_active"
+  fi
+  return 0
+}
+
+write_dnsmasq_conf() {
+  {
+    if [ "$2" = 1 ]; then
+      printf '%s\n' "listen-address=127.0.0.1" "bind-interfaces" "no-resolv" "no-hosts" \
+        "cache-size=1000" "domain-needed"
+      if [ -s "$CFG/upstream.dns" ]; then
+        awk 'NF { print "server=" $1 }' "$CFG/upstream.dns"
+      else
+        printf '%s\n' "server=1.1.1.1" "server=8.8.8.8"
+      fi
+    fi
+    awk 'NF { print "address=/" $1 "/" }' "$CFG/dns.list"
+  } >"$1"
+}
+
+pick_probe_domain() {
+  for _pd in iana.org icann.org example.org cloudflare.com; do
+    grep -qxF "$_pd" "$CFG/dns.list" 2>/dev/null || { printf '%s\n' "$_pd"; return 0; }
+  done
+  printf '%s\n' iana.org
+}
+
 dnsmasq_apply() {
   [ -s "$CFG/dns.list" ] || return 0
   _dm_shared=0
-  if [ ! -f "$CFG/dnsmasq.owned" ] && { [ "$OS_ID" = openwrt ] || pidof dnsmasq >/dev/null 2>&1; }; then
+  if [ ! -f "$CFG/dnsmasq.owned" ] && { [ "$OS_ID" = openwrt ] || dnsmasq_up; }; then
     _dm_shared=1
   fi
   if [ "$_dm_shared" = 0 ]; then
-    # resolv.conf 是链接时归 systemd-resolved 之类管，本机不会来问这个 dnsmasq，拦了等于没拦。
-    [ -L /etc/resolv.conf ] && return 1
     pick_resolver
-    case $RESOLVER in dig|host|nslookup) ;; *) return 1 ;; esac
+    case $RESOLVER in dig|host|nslookup|drill) ;; *) return 1 ;; esac
   fi
   mkdir -p /etc/dnsmasq.d 2>/dev/null
   [ -d /etc/dnsmasq.d ] || return 1
-  # 先写好配置再装，Debian 装完会马上启动，这样一开始就只听 127.0.0.1。
   write_dnsmasq_conf "$WORKDIR/dnsmasq.conf" "$((1 - _dm_shared))"
   _dm_changed=0
   if ! cmp -s "$WORKDIR/dnsmasq.conf" /etc/dnsmasq.d/vps-fengjin.conf 2>/dev/null; then
@@ -1433,39 +1765,74 @@ dnsmasq_apply() {
     return 1
   fi
   if ! dnsmasq_reads_confdir; then
+    [ -f /etc/dnsmasq.conf ] || : >/etc/dnsmasq.conf
     printf '\n%s\n' "conf-dir=/etc/dnsmasq.d/,*.conf" >>/etc/dnsmasq.conf
     printf '%s\n' 1 >"$CFG/dnsmasq.confdir"
     _dm_changed=1
   fi
   if [ "$_dm_shared" = 1 ]; then
-    if [ "$_dm_changed" = 1 ] || ! pidof dnsmasq >/dev/null 2>&1; then
+    if ! dnsmasq --test >/dev/null 2>&1; then
+      dnsmasq_clear
+      return 1
+    fi
+    if [ "$_dm_changed" = 1 ] || ! dnsmasq_up; then
       restart_dnsmasq || { dnsmasq_clear; return 1; }
     fi
     return 0
   fi
+  if ! dnsmasq --test --conf-file=/etc/dnsmasq.d/vps-fengjin.conf >/dev/null 2>&1; then
+    dnsmasq_clear
+    return 1
+  fi
+  if [ ! -f "$CFG/resolv.conf.link" ] && [ -L /etc/resolv.conf ]; then
+    _dm_link=$(readlink /etc/resolv.conf 2>/dev/null)
+    [ -n "$_dm_link" ] && printf '%s\n' "$_dm_link" >"$CFG/resolv.conf.link"
+  fi
   if [ ! -f "$CFG/resolv.conf.bak" ] && [ -f /etc/resolv.conf ] \
     && ! grep -q 'vps-fengjin managed' /etc/resolv.conf 2>/dev/null; then
-    cp /etc/resolv.conf "$CFG/resolv.conf.bak" || return 1
+    cp /etc/resolv.conf "$CFG/resolv.conf.bak" 2>/dev/null || true
   fi
   printf '%s\n' 1 >"$CFG/dnsmasq.owned"
-  if [ "$_dm_changed" = 1 ] || ! pidof dnsmasq >/dev/null 2>&1; then
+  if [ "$_dm_changed" = 1 ] || ! dnsmasq_up; then
     restart_dnsmasq || { dnsmasq_clear; return 1; }
   fi
-  # 确认 dnsmasq 真的能回答，才把本机 DNS 指过去，不然这台机器会断网。
-  if [ -z "$(resolve_probe iana.org 127.0.0.1)" ]; then
+  # 双重校验：1) 能正常解析外部网站（避免断网）；2) 确实拦截了名单中的域名。
+  _dm_probe=$(pick_probe_domain)
+  if [ -z "$(resolve_probe "$_dm_probe" 127.0.0.1)" ]; then
     dnsmasq_clear
     return 1
   fi
-  # 有的容器平台把 resolv.conf 设成只读，写不进去就别假装成功。
-  if ! printf '%s\n' "# vps-fengjin managed" "nameserver 127.0.0.1" >/etc/resolv.conf 2>/dev/null; then
-    say_warn "/etc/resolv.conf 改不了（只读），本机不会去问 dnsmasq。"
+  _dm_first=$(head -n 1 "$CFG/dns.list" 2>/dev/null)
+  if [ -n "$_dm_first" ] && [ -n "$(resolve_probe "$_dm_first" 127.0.0.1)" ]; then
     dnsmasq_clear
     return 1
+  fi
+  # 切换系统 DNS：若 /etc/resolv.conf 是软链接（如 Ubuntu systemd-resolved），安全替换并在关闭时原样恢复。
+  if [ -L /etc/resolv.conf ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
+      && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+      printf '%s\n' 1 >"$CFG/resolved.was_active"
+    fi
+    if ! printf '%s\n' "# vps-fengjin managed" "nameserver 127.0.0.1" >/etc/resolv.conf.vps-fengjin.tmp 2>/dev/null \
+      || ! mv -f /etc/resolv.conf.vps-fengjin.tmp /etc/resolv.conf 2>/dev/null; then
+      rm -f /etc/resolv.conf.vps-fengjin.tmp 2>/dev/null
+      say_warn "/etc/resolv.conf 无法修改，改为 /etc/hosts 方式。"
+      dnsmasq_clear
+      return 1
+    fi
+    if [ -f "$CFG/resolved.was_active" ]; then
+      systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+    fi
+  else
+    if ! printf '%s\n' "# vps-fengjin managed" "nameserver 127.0.0.1" >/etc/resolv.conf 2>/dev/null; then
+      say_warn "/etc/resolv.conf 为只读文件，改为 /etc/hosts 方式。"
+      dnsmasq_clear
+      return 1
+    fi
   fi
   return 0
 }
 
-# 按方式写好域名拦截，并清掉其他方式留下的东西。
 dns_apply() {
   case $1 in
     hosts)
@@ -1475,7 +1842,7 @@ dns_apply() {
     dnsmasq)
       hosts_clear
       if ! dnsmasq_apply; then
-        say_warn "dnsmasq 没接好，改写入 /etc/hosts（子域名拦不住）。"
+        say_warn "本地 DNS 服务（dnsmasq）未能接管，已自动降级为 /etc/hosts 拦截（仅覆盖主域名与 www）。"
         printf '%s\n' hosts >"$CFG/dns.method"
         hosts_apply
       fi
@@ -1487,22 +1854,31 @@ dns_apply() {
   esac
 }
 
-# load_rules [1=同时写域名拦截]
+# load_rules [1=同时应用域名配置]
 load_rules() {
   probe_firewall
   _lr_method=$(cat "$CFG/dns.method" 2>/dev/null || echo none)
   if [ "$_lr_method" = string ] && { [ "$FW_BACKEND" != iptables ] || [ "$V4_STRING" != 1 ]; }; then
-    say_warn "当前防火墙不能按域名拦 DNS 查询，改写入 /etc/hosts。"
-    _lr_method=hosts
-    printf '%s\n' hosts >"$CFG/dns.method"
+    if command -v dnsmasq >/dev/null 2>&1; then
+      _lr_method=dnsmasq
+    else
+      say_warn "当前防火墙不支持按域名匹配，改为 /etc/hosts 方式。"
+      _lr_method=hosts
+    fi
+    printf '%s\n' "$_lr_method" >"$CFG/dns.method"
   fi
   if [ "$FW_BACKEND" = none ]; then
-    # 只拦域名：没有防火墙规则可写。开机时也要把 dnsmasq 拉起来（容器里不会自己起）。
     dns_apply "$_lr_method" || return 1
     return 0
   fi
   apply_firewall || return 1
-  [ "${1:-0}" = 1 ] && dns_apply "$_lr_method"
+  if [ "${1:-0}" = 1 ]; then
+    dns_apply "$_lr_method" || return 1
+  elif [ "$_lr_method" = dnsmasq ] && ! dns_live; then
+    # 开机时若 DHCP 重写了 resolv.conf 或 dnsmasq 未起，自动恢复接管。
+    dns_apply dnsmasq || true
+  fi
+  [ "$_lr_method" = string ] && flush_dns_cache
   return 0
 }
 
@@ -1513,12 +1889,12 @@ disable_all() {
 }
 
 #----------------------------------------------------------------------
-# 查 DNS：只用来确认 dnsmasq 是不是真的能回答。域名不再解析成 IP 去封。
+# DNS 探测与上游记录
 #----------------------------------------------------------------------
 
 pick_resolver() {
   RESOLVER=none
-  for _r in dig host nslookup getent; do
+  for _r in dig host nslookup drill getent; do
     if command -v "$_r" >/dev/null 2>&1; then
       RESOLVER=$_r
       return 0
@@ -1526,13 +1902,10 @@ pick_resolver() {
   done
 }
 
-# 设置时可以装一个查 DNS 的命令；定时刷新不装软件。
-# dnsmasq 接好后要查一次确认它真的能回答，没命令就装一个，不然只能退回 hosts。
 ensure_resolver() {
   pick_resolver
-  case $RESOLVER in dig|host|nslookup) return 0 ;; esac
+  case $RESOLVER in dig|host|nslookup|drill) return 0 ;; esac
   [ "${1:-}" = setup ] || return 0
-  say_info "没有查 DNS 的命令，尝试装一个。"
   need_cmd dig dnsutils bind9-dnsutils bind-utils bind-tools bind-dig bind || true
   pick_resolver
 }
@@ -1540,7 +1913,6 @@ ensure_resolver() {
 with_timeout() {
   _wt_secs=$1
   shift
-  # 老版本 busybox 的 timeout 要写成 timeout -t 秒数，先试一次看哪种能用。
   if [ -z "${TIMEOUT_STYLE:-}" ]; then
     TIMEOUT_STYLE=none
     if timeout 1 true >/dev/null 2>&1; then
@@ -1556,18 +1928,62 @@ with_timeout() {
   esac
 }
 
-# 查一个名字，打印查到的 IP（可能为空）。$2 是 DNS 服务器。
-# 只用来确认 dnsmasq 是不是真的能回答：输出里有 DNS 服务器自己以外的 IP 就算能回答。
 resolve_probe() {
   pick_resolver
   case $RESOLVER in
     dig) dig "@$2" +time=2 +tries=1 +short "$1" A 2>/dev/null ;;
     host) host -W 2 -t A "$1" "$2" 2>/dev/null ;;
     nslookup) with_timeout 5 nslookup "$1" "$2" 2>/dev/null ;;
+    drill) with_timeout 5 drill "@$2" "$1" A 2>/dev/null ;;
     *) : ;;
   esac | awk -v server="$2" '
     { for (i = 1; i <= NF; i++)
         if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i != server) print $i }'
+}
+
+# 用本机默认解析器做一次真实解析测试（vps-fengjin test 使用）。
+# $2 = hosts 时优先用 getent（尊重 /etc/hosts），否则直接查 DNS。
+resolve_system() {
+  if [ "${2:-}" = hosts ] && command -v getent >/dev/null 2>&1; then
+    with_timeout 3 getent ahosts "$1" 2>/dev/null | awk '
+      $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || $1 ~ /:/ { print $1 }
+    ' | LC_ALL=C sort -u | head -n 4
+    return 0
+  fi
+  pick_resolver
+  case $RESOLVER in
+    dig)
+      dig +time=2 +tries=1 +short "$1" A 2>/dev/null \
+        | awk '$0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print }' | head -n 4
+      ;;
+    host)
+      host -W 2 -t A "$1" 2>/dev/null \
+        | awk '$2 == "has" && $3 == "address" && $4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $4 }' | head -n 4
+      ;;
+    nslookup)
+      # 只取 Name: 之后的解析结果，避免把顶部 Server: 8.8.8.8 误判成解析成功。
+      with_timeout 3 nslookup "$1" 2>/dev/null | awk '
+        /^Name:/ { ans = 1; next }
+        ans {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i
+          }
+        }
+      ' | head -n 4
+      ;;
+    drill)
+      with_timeout 3 drill "$1" A 2>/dev/null | awk '
+        /^;; ANSWER SECTION:/ { ans = 1; next }
+        /^;;/ { ans = 0 }
+        ans && $4 == "A" && $5 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $5 }
+      ' | head -n 4
+      ;;
+    getent)
+      with_timeout 3 getent ahosts "$1" 2>/dev/null \
+        | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1 }' | LC_ALL=C sort -u | head -n 4
+      ;;
+    *) : ;;
+  esac
 }
 
 save_upstreams() {
@@ -1575,34 +1991,35 @@ save_upstreams() {
     return 0
   fi
   : >"$CFG/upstream.dns"
-  # systemd-resolved 的 resolv.conf 只写 127.0.0.53，真正的上游在 /run 里那份。
-  # Docker 的 127.0.0.11 是真正的上游，要留着。
   for _sf in /etc/resolv.conf /run/systemd/resolve/resolv.conf; do
     [ -s "$CFG/upstream.dns" ] && break
-    awk '$1 == "nameserver" && $2 != "127.0.0.1" && $2 != "127.0.0.53" && $2 != "::1" { print $2 }' "$_sf" \
-      >"$CFG/upstream.dns" 2>/dev/null
+    awk '
+      $1 == "nameserver" {
+        sub(/\r$/, "", $2)
+        if ($2 != "" && $2 != "127.0.0.1" && $2 != "127.0.0.53" && $2 != "127.0.0.54" && $2 != "::1") print $2
+      }
+    ' "$_sf" >"$CFG/upstream.dns" 2>/dev/null
   done
-  [ -s "$CFG/upstream.dns" ] || printf '%s\n' 1.1.1.1 8.8.8.8 >"$CFG/upstream.dns"
+  if [ ! -s "$CFG/upstream.dns" ]; then
+    if ipv6_on && command -v ip >/dev/null 2>&1 && ! ip -4 route show default 2>/dev/null | grep -q .; then
+      printf '%s\n' "2606:4700:4700::1111" "2001:4860:4860::8888" >"$CFG/upstream.dns"
+    else
+      printf '%s\n' 1.1.1.1 8.8.8.8 >"$CFG/upstream.dns"
+    fi
+  fi
 }
 
 choose_dns_method() {
-  # $1 = 域名个数。域名分不了端口，按端口封时也一样在 DNS 这一层拦。
+  # $1 = 域名条数。域名不分端口，始终在解析层拦截（含子域名）。
   if [ "$1" -eq 0 ]; then
     printf '%s\n' none
-  elif [ "$FW_BACKEND" = none ]; then
-    # 只拦域名：要连子域名一起拦，优先 dnsmasq，装不上才用 hosts。
-    if [ "$OS_ID" = openwrt ] || command -v dnsmasq >/dev/null 2>&1 || [ "${PM:-none}" != none ]; then
-      printf '%s\n' dnsmasq
-    else
-      printf '%s\n' hosts
-    fi
   elif [ "$OS_ID" = openwrt ]; then
     printf '%s\n' dnsmasq
-  elif [ "$1" -le 400 ] && [ "$FW_BACKEND" = iptables ] && [ "$V4_STRING" = 1 ]; then
+  elif [ "$FW_BACKEND" = iptables ] && [ "$V4_STRING" = 1 ] && [ "$1" -le 400 ]; then
+    # 400 个以内域名优先用防火墙子链直接拦 DNS 查询：不改系统 DNS、无额外服务、含子域名。
     printf '%s\n' string
-  elif [ "$1" -le 400 ]; then
-    printf '%s\n' hosts
   elif command -v dnsmasq >/dev/null 2>&1 || [ "${PM:-none}" != none ]; then
+    # 超过 400 个域名、nftables 或无防火墙权限：优先用 dnsmasq，支持大名单与子域名。
     printf '%s\n' dnsmasq
   else
     printf '%s\n' hosts
@@ -1610,17 +2027,24 @@ choose_dns_method() {
 }
 
 #----------------------------------------------------------------------
-# 不能封的地址：你的 SSH 来源、本机地址、本机用的 DNS 服务器。
-# 封了它们会把自己锁在外面，或者让这台机器整个解析不了域名。
+# 防误封保护：自动跳过 SSH 登录 IP、本机地址、上游 DNS
 #----------------------------------------------------------------------
 
-# /proc/net/tcp(6) 里正在连着 sshd 端口的远端地址。
 ssh_peers_from_proc() {
   _sp_ports=22
   set -- ${SSH_CONNECTION:-}
   [ -n "${4:-}" ] && _sp_ports="$_sp_ports $4"
-  _sp_ports="$_sp_ports $(awk 'tolower($1) == "port" { print $2 }' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)"
-  _sp_hex=$(for _p in $_sp_ports; do printf '%04X ' "$_p" 2>/dev/null; done)
+  for _sp_cfg in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+    [ -r "$_sp_cfg" ] || continue
+    _sp_ports="$_sp_ports $(awk 'tolower($1) == "port" { print $2 }' "$_sp_cfg" 2>/dev/null)"
+  done
+  _sp_hex=""
+  for _p in $_sp_ports; do
+    case $_p in
+      ''|*[!0-9]*) continue ;;
+      *) _sp_hex="${_sp_hex}$(printf '%04X ' "$_p" 2>/dev/null)" ;;
+    esac
+  done
   for _sp_f in /proc/net/tcp /proc/net/tcp6; do
     [ -r "$_sp_f" ] || continue
     awk -v ports=" $_sp_hex" '
@@ -1630,7 +2054,6 @@ ssh_peers_from_proc() {
         for (i = 1; i <= length(h); i++) v = v * 16 + index("0123456789ABCDEF", substr(h, i, 1)) - 1
         return v
       }
-      # 内核按机器字节序存，每 4 字节一组要倒过来（按常见的小端机器处理）。
       function word(h) {
         return substr(h, 7, 2) substr(h, 5, 2) substr(h, 3, 2) substr(h, 1, 2)
       }
@@ -1645,7 +2068,7 @@ ssh_peers_from_proc() {
         if (length(h) == 8) { print dotted(word(h)); next }
         if (length(h) != 32) next
         full = word(substr(h, 1, 8)) word(substr(h, 9, 8)) word(substr(h, 17, 8)) word(substr(h, 25, 8))
-        if (substr(full, 1, 24) == "00000000000000000000FFFF") { print dotted(substr(full, 25, 8)); next }
+        if (toupper(substr(full, 1, 24)) == "00000000000000000000FFFF") { print dotted(substr(full, 25, 8)); next }
         out = ""
         for (i = 0; i < 8; i++) out = out (i ? ":" : "") tolower(substr(full, i * 4 + 1, 4))
         print out
@@ -1657,17 +2080,18 @@ ssh_peers_from_proc() {
 collect_excludes() {
   _ce_out=$1
   : >"$_ce_out"
+  : >"$WORKDIR/ssh.now"
   for _ce_v in "${SSH_CONNECTION:-}" "${SSH_CLIENT:-}"; do
     set -- $_ce_v
-    [ -n "${1:-}" ] && printf '%s\n' "$1" >>"$WORKDIR/ssh.now"
+    [ -n "${1:-}" ] && printf '%s\n' "${1%%%*}" >>"$WORKDIR/ssh.now"
   done
-  # 定时刷新没有 SSH 环境变量。把设置时的登录地址记下来，以后每次都躲开。
+  # sudo 运行时会清掉 SSH 环境变量，所以把 /proc 里正在连 sshd 的来源也一起记下来。
+  ssh_peers_from_proc >>"$WORKDIR/ssh.now"
   if [ -s "$WORKDIR/ssh.now" ]; then
     cat "$WORKDIR/ssh.now" "$CFG/ssh.peers" 2>/dev/null | LC_ALL=C sort -u | tail -n 20 >"$WORKDIR/ssh.peers"
     cat "$WORKDIR/ssh.peers" >"$CFG/ssh.peers"
   fi
   cat "$CFG/ssh.peers" >>"$_ce_out" 2>/dev/null
-  ssh_peers_from_proc >>"$_ce_out"
   if command -v ip >/dev/null 2>&1; then
     ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" { split($4, a, "/"); print a[1] }' >>"$_ce_out"
   fi
@@ -1675,7 +2099,6 @@ collect_excludes() {
   LC_ALL=C sort -u "$_ce_out" -o "$_ce_out"
 }
 
-# filter_family 4|6 原始地址 输出 排除表
 filter_family() {
   : >"$WORKDIR/skip.$1"
   : >"$3"
@@ -1686,8 +2109,6 @@ filter_family() {
     | awk -F '\t' 'NF >= 2 { print $2 }' >"$3"
 }
 
-# 把名单变成要封的 IP 表和要拦的域名表。
-# 域名只进 dns.list，在 DNS 这一层拦；只有名单里直接写的 IP / 网段才进防火墙。
 rebuild_ips() {
   for _f in v4.raw v6.raw dns.names; do
     : >"$WORKDIR/$_f"
@@ -1700,7 +2121,6 @@ rebuild_ips() {
   LC_ALL=C sort -u "$WORKDIR/dns.names" -o "$WORKDIR/dns.list"
   _rb_method=$(choose_dns_method "$(count_lines "$WORKDIR/dns.list")")
   if [ "$FW_BACKEND" = none ]; then
-    # 只拦域名：IP 没处封。
     : >"$CFG/v4"
     : >"$CFG/v6"
     cat "$WORKDIR/dns.list" >"$CFG/dns.list"
@@ -1714,13 +2134,13 @@ rebuild_ips() {
   printf '%s\n' "$_rb_method" >"$CFG/dns.method"
   cat "$WORKDIR/skip.4" "$WORKDIR/skip.6" >"$WORKDIR/skipped" 2>/dev/null
   if [ -s "$WORKDIR/skipped" ]; then
-    say_warn "下面这些地址包含你的 SSH 来源、本机地址或本机用的 DNS 服务器，已跳过："
-    head -n 8 "$WORKDIR/skipped" | awk -F '\t' '{ print "  " $1 "（包含 " $2 "）" }'
+    say_warn "防误封保护：已自动跳过以下包含 SSH 来源、本机地址或 DNS 的条目："
+    head -n 8 "$WORKDIR/skipped" | awk -F '\t' '{ print "    " $1 "（保护了 " $2 "）" }'
   fi
 }
 
 #----------------------------------------------------------------------
-# 开机继续生效、定时刷新
+# 安装快捷命令、开机自启与定时巡检
 #----------------------------------------------------------------------
 
 installed_bin() {
@@ -1733,7 +2153,6 @@ installed_bin() {
   fi
 }
 
-# 把正在跑的脚本装成 vps-fengjin 命令。开机自启和定时刷新都调它。
 install_self() {
   _is_dest=$BIN_DEFAULT
   mkdir -p /usr/local/sbin 2>/dev/null || _is_dest=/usr/sbin/vps-fengjin
@@ -1743,21 +2162,24 @@ install_self() {
     *) _is_src=$(pwd)/$_is_src ;;
   esac
   if [ ! -f "$_is_src" ] || ! grep -q 'vps-fengjin-onekey-begin' "$_is_src" 2>/dev/null; then
-    # 例如 curl ... | sh：脚本没有落成文件，没法装成命令。
     [ -x "$(installed_bin)" ] && return 0
-    die "请先把脚本下载成文件再运行（README 里的一键命令就是这样做的），不然装不成 vps-fengjin 命令，重启后也不会自动封上。"
+    die "请先将脚本下载为文件再运行（可直接使用 README 中的一键命令），否则无法安装 vps-fengjin 快捷命令。"
   fi
-  [ "$_is_src" = "$_is_dest" ] && return 0
-  cp "$_is_src" "$_is_dest.new" && chmod 755 "$_is_dest.new" && mv -f "$_is_dest.new" "$_is_dest"
+  if [ "$_is_src" != "$_is_dest" ]; then
+    cp "$_is_src" "$_is_dest.new" && chmod 755 "$_is_dest.new" && mv -f "$_is_dest.new" "$_is_dest"
+  fi
+  # 部分系统默认 PATH 不含 /usr/local/sbin，额外在 /usr/local/bin 建软链接确保随时能打 vps-fengjin。
+  if [ -d /usr/local/bin ] && [ "$_is_dest" != "$BIN_LINK" ]; then
+    ln -sf "$_is_dest" "$BIN_LINK" 2>/dev/null || true
+  fi
 }
 
 write_systemd() {
   mkdir -p /etc/systemd/system
-  # 排在常见防火墙服务之后：它们启动时会清空规则，排在后面才不会被冲掉。
   cat >/etc/systemd/system/vps-fengjin.service <<EOF
 [Unit]
-Description=Apply saved outbound block list
-After=network.target firewalld.service ufw.service netfilter-persistent.service nftables.service iptables.service docker.service
+Description=Apply saved outbound block list (vps-fengjin)
+After=network.target firewalld.service ufw.service netfilter-persistent.service nftables.service iptables.service docker.service dnsmasq.service
 
 [Service]
 Type=oneshot
@@ -1769,7 +2191,7 @@ WantedBy=multi-user.target
 EOF
   cat >/etc/systemd/system/vps-fengjin-refresh.service <<EOF
 [Unit]
-Description=Re-apply outbound block list
+Description=Re-apply outbound block list (vps-fengjin)
 
 [Service]
 Type=oneshot
@@ -1777,7 +2199,7 @@ ExecStart=$1 refresh
 EOF
   cat >/etc/systemd/system/vps-fengjin-refresh.timer <<EOF
 [Unit]
-Description=Re-apply outbound block list every 6 hours
+Description=Re-apply outbound block list every 6 hours (vps-fengjin)
 
 [Timer]
 OnBootSec=5min
@@ -1794,12 +2216,14 @@ EOF
 append_marked() {
   touch "$1"
   strip_marked_file "$1"
-  # rc.local 最后一行常是 exit 0，加在它后面不会执行，所以插到它前面。
   awk -v line="$2" '
     { lines[++n] = $0 }
     END {
       at = n + 1
-      for (i = n; i >= 1; i--) { if (lines[i] ~ /^[ \t]*exit[ \t]+0[ \t]*$/) { at = i; break } if (lines[i] !~ /^[ \t]*$/) break }
+      for (i = n; i >= 1; i--) {
+        if (lines[i] ~ /^[ \t]*exit[ \t]+0[ \t]*$/) { at = i; break }
+        if (lines[i] !~ /^[ \t]*$/) break
+      }
       for (i = 1; i < at; i++) print lines[i]
       print "# BEGIN vps-fengjin"
       print line
@@ -1812,10 +2236,11 @@ append_marked() {
 
 install_persistence() {
   _ip_bin=$(installed_bin)
-  # 每 6 小时重新封一次：别的防火墙重载把规则清掉时，能自己恢复。
+  PERSIST_OK=1
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     write_systemd "$_ip_bin"
     systemctl enable --now vps-fengjin-refresh.timer >/dev/null 2>&1
+    printf '%s\n' 1 >"$WORKDIR/persist.ok"
     return 0
   fi
   if [ -f /etc/openwrt_release ]; then
@@ -1826,7 +2251,6 @@ start() { $_ip_bin apply-rules; }
 EOF
     chmod 755 /etc/init.d/vps-fengjin
     /etc/init.d/vps-fengjin enable >/dev/null 2>&1
-    # OpenWrt 重载防火墙时会清掉规则，firewall.user 会在每次重载后执行。
     append_marked /etc/firewall.user "$_ip_bin apply-rules"
   elif command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; then
     cat >/etc/init.d/vps-fengjin <<EOF
@@ -1840,9 +2264,11 @@ EOF
     rc-update add vps-fengjin default >/dev/null 2>&1
   elif [ -f /etc/rc.local ]; then
     append_marked /etc/rc.local "$_ip_bin apply-rules"
+    chmod +x /etc/rc.local 2>/dev/null || true
   else
-    say_warn "这台机器没有开机自启的地方（容器里常见）。机器或容器重启后，运行一次 vps-fengjin on 就会重新生效。"
+    PERSIST_OK=0
   fi
+  printf '%s\n' "$PERSIST_OK" >"$WORKDIR/persist.ok"
   remove_cron
   if [ -d /etc/cron.d ]; then
     printf '17 */6 * * * root %s refresh >/dev/null 2>&1\n' "$_ip_bin" >/etc/cron.d/vps-fengjin
@@ -1870,7 +2296,6 @@ remove_persistence() {
     systemctl daemon-reload >/dev/null 2>&1
   fi
   command -v rc-update >/dev/null 2>&1 && rc-update del vps-fengjin default >/dev/null 2>&1
-  # OpenWrt 要先 disable，不然 /etc/rc.d 里留下指向空文件的链接。
   if [ -f /etc/openwrt_release ] && [ -x /etc/init.d/vps-fengjin ]; then
     /etc/init.d/vps-fengjin disable >/dev/null 2>&1
   fi
@@ -1881,36 +2306,50 @@ remove_persistence() {
 }
 
 #----------------------------------------------------------------------
-# 名单：读入、识别、每份单独存。
-#   $CFG/sources/<编号>/      已经生效的名单
-#   $WORKDIR/sources/<编号>/  这次新加、还没确认的名单
-# 每个目录里：name 备注名，kind 来源（url / file / paste / old），
-#   origin 网址或文件路径，count「域名 后缀 IP」个数，list 识别后的名单。
+# 名单导入、识别、预览与在线更新
 #----------------------------------------------------------------------
 
 fetch_url() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 120 --max-filesize "$LIST_MAX_BYTES" -o "$2" "$1" && return 0
+    curl -fsSL --connect-timeout 15 --max-time 120 --max-filesize "$LIST_MAX_BYTES" -o "$2" "$1" 2>"$WORKDIR/fetch.err"
+    _fu_rc=$?
+    [ "$_fu_rc" -eq 0 ] && return 0
+    if [ "$_fu_rc" -eq 63 ]; then
+      say_err "链接文件超过 ${LIST_MAX_MB}MB 上限，未下载。"
+      return 2
+    fi
+    return 1
   fi
   if command -v wget >/dev/null 2>&1; then
-    wget -q -T 60 -O "$2" "$1" && return 0
+    wget -q -T 30 -O "$2" "$1" 2>"$WORKDIR/fetch.err" && return 0
+    return 1
   fi
+  say_err "系统缺少 curl / wget，无法下载在线名单。"
   return 1
 }
 
-# read_source 网址/路径/- 输出：把名单原文放进输出文件。
 read_source() {
   list_limits
   : >"$2"
   case $1 in
     http://*|https://*)
-      if ! fetch_url "$1" "$2"; then
-        say_err "下载失败。请检查网址拼写，以及这台机器能不能连上那个网站。"
+      _rs_url=$(normalize_url "$1")
+      if [ "$_rs_url" != "$1" ]; then
+        say_info "检测到 GitHub 网页链接，已自动转为直链下载。"
+      fi
+      say_dim "  正在下载名单..."
+      fetch_url "$_rs_url" "$2"
+      _rs_rc=$?
+      if [ "$_rs_rc" -ne 0 ]; then
+        if [ "$_rs_rc" -eq 1 ]; then
+          say_err "下载失败，请检查链接是否正确，或服务器能否访问该网址。"
+          [ -s "$WORKDIR/fetch.err" ] && say_dim "  原因：$(head -n 1 "$WORKDIR/fetch.err")"
+        fi
         return 1
       fi
       ;;
     *://*)
-      say_err "只接受 http 或 https 网址。"
+      say_err "只支持 http:// 或 https:// 开头的链接。"
       return 1
       ;;
     -)
@@ -1919,23 +2358,23 @@ read_source() {
       ;;
     *)
       if [ ! -f "$1" ]; then
-        say_err "找不到文件：$1"
+        say_err "找不到这个文件：$1"
         return 1
       fi
       if [ "$(wc -c <"$1")" -gt "$LIST_MAX_BYTES" ]; then
-        say_err "文件超过 ${LIST_MAX_MB}MB，这台机器吃不消。"
+        say_err "文件超过 ${LIST_MAX_MB}MB，这台机器内存吃不消。"
         return 1
       fi
       cat "$1" >"$2"
       ;;
   esac
   if [ "$(wc -c <"$2")" -gt "$LIST_MAX_BYTES" ]; then
-    say_err "名单超过 ${LIST_MAX_MB}MB，这台机器吃不消。"
+    say_err "名单超过 ${LIST_MAX_MB}MB，这台机器内存吃不消。"
     return 1
   fi
-  case $(dd if="$2" bs=200 count=1 2>/dev/null | tr 'A-Z' 'a-z') in
+  case $(dd if="$2" bs=2048 count=1 2>/dev/null | tr 'A-Z' 'a-z') in
     *'<html'*|*'<!doctype'*)
-      say_err "读到的是网页，不是名单。如果是 GitHub 链接，请用 Raw 按钮打开后的地址。"
+      say_err "下载到的是普通网页而不是纯文本名单，请确认链接指向的是规则原文。"
       return 1
       ;;
   esac
@@ -1944,11 +2383,11 @@ read_source() {
 
 bad_reason() {
   case $1 in
-    wide) printf '%s\n' "网段太大，怕把整台机器封死" ;;
-    local) printf '%s\n' "这是本机或特殊地址" ;;
-    keyword) printf '%s\n' "关键词规则太宽，不支持" ;;
-    unsupported) printf '%s\n' "这种规则类型不支持" ;;
-    *) printf '%s\n' "看不懂" ;;
+    wide) printf '%s\n' "网段过大（防止误封整台机器）" ;;
+    local) printf '%s\n' "本机或保留地址" ;;
+    keyword) printf '%s\n' "关键词规则范围太广，不支持" ;;
+    unsupported) printf '%s\n' "不支持此类规则" ;;
+    *) printf '%s\n' "格式无法识别" ;;
   esac
 }
 
@@ -1967,15 +2406,29 @@ summarize_list() {
   ' "$1" 2>/dev/null)"
 }
 
+# 生成几条示例文本，如 "baidu.com, qq.com 等"，让小白直观确认解析结果。
+sample_items() {
+  # $1 = list 文件, $2 = domain|ip, $3 = 最多几条
+  [ -s "$1" ] || return 0
+  awk -F '\t' -v want="$2" -v lim="${3:-3}" '
+    (want == "domain" && ($1 == "domain" || $1 == "suffix")) || (want == "ip" && $1 ~ /^(ip|net)[46]$/) {
+      c++
+      if (c <= lim) out = (out == "" ? $2 : out "、" $2)
+    }
+    END {
+      if (out != "") printf "%s%s\n", out, (c > lim ? " 等" : "")
+    }
+  ' "$1"
+}
+
 show_bads() {
   [ "$N_BAD" -gt 0 ] || return 0
-  say_warn "有 $N_BAD 行没用上，最多显示 8 行："
-  awk -F '\t' '$1 == "bad" { print $2 "\t" $3 }' "$1" | head -n 8 | while IFS='	' read -r _sb_code _sb_rest; do
-    printf '  %s：%s\n' "$(bad_reason "$_sb_code")" "$_sb_rest"
+  say_warn "已跳过 $N_BAD 条无效或不支持的记录（最多展示 5 条）："
+  awk -F '\t' '$1 == "bad" { print $2 "\t" $3 }' "$1" | head -n 5 | while IFS='	' read -r _sb_code _sb_rest; do
+    printf '    %s：%s\n' "$(bad_reason "$_sb_code")" "$_sb_rest"
   done
 }
 
-# 识别名单，并按内存截掉超出上限的域名。IP 进 ipset，全部保留。
 classify_raw() {
   fengjin_awk classify <"$1" >"$WORKDIR/class.all"
   list_limits
@@ -1988,7 +2441,7 @@ classify_raw() {
   ' "$WORKDIR/class.all"
   _cr_n=$(cat "$WORKDIR/class.nnames")
   if [ "$_cr_n" -gt "$LIST_MAX_ITEMS" ]; then
-    say_warn "名单里有 $_cr_n 个域名，这台机器最多用 $LIST_MAX_ITEMS 个，后面的不用。"
+    say_warn "这份名单含 $_cr_n 个域名，本机内存上限为 $LIST_MAX_ITEMS 个，超出部分已截断。"
   fi
   LC_ALL=C sort -u "$WORKDIR/class.keep" >"$2"
 }
@@ -1997,7 +2450,7 @@ cap_list() {
   list_limits
   _cl_n=$(awk -F '\t' '$1 == "domain" || $1 == "suffix" { c++ } END { print c + 0 }' "$1")
   [ "$_cl_n" -gt "$LIST_MAX_ITEMS" ] || return 0
-  say_warn "几份名单合起来域名超过 $LIST_MAX_ITEMS 个，这台机器只保留前 $LIST_MAX_ITEMS 个。"
+  say_warn "多份名单合并后域名超过 $LIST_MAX_ITEMS 个，本机仅保留前 $LIST_MAX_ITEMS 个。"
   awk -F '\t' -v cap="$LIST_MAX_ITEMS" '
     $1 == "domain" || $1 == "suffix" { if (++c > cap) next }
     { print }
@@ -2009,8 +2462,7 @@ clean_name() {
   printf '%s' "$1" | tr -d '\000-\037' | sed 's/^[[:blank:]]*//;s/[[:blank:]]*$//'
 }
 
-# 列出名单目录。saved：已生效的；pending：这次新加的；all：两者都列。
-# 标记了要删除的（$WORKDIR/del.list）不算在 all 里。
+# 列出名单目录：saved=已生效, pending=本次新加, all=已生效+本次新加
 source_dirs() {
   if [ "$1" != pending ] && [ -d "$CFG/sources" ]; then
     for _sd in $(ls "$CFG/sources" 2>/dev/null | LC_ALL=C sort -n); do
@@ -2028,6 +2480,10 @@ source_dirs() {
   fi
 }
 
+count_sources() {
+  source_dirs "$1" | awk 'END { print NR + 0 }'
+}
+
 next_source_id() {
   { ls "$CFG/sources" 2>/dev/null; ls "${PENDING:-/nonexistent}" 2>/dev/null; } \
     | awk '$1 ~ /^[0-9]+$/ && $1 + 0 > m { m = $1 + 0 } END { print m + 1 }'
@@ -2039,21 +2495,15 @@ show_source_line() {
   _ss_origin=$(cat "$_ss_d/origin" 2>/dev/null)
   set -- "$1" $(cat "$_ss_d/count" 2>/dev/null) 0 0 0
   case $(cat "$_ss_d/kind" 2>/dev/null) in
-    url) _ss_from="网址 $_ss_origin" ;;
-    file) _ss_from="文件 $_ss_origin" ;;
-    paste) _ss_from="粘贴" ;;
-    *) _ss_from="升级前的名单" ;;
+    url) _ss_from="在线链接：$_ss_origin" ;;
+    file) _ss_from="本地文件：$_ss_origin" ;;
+    paste) _ss_from="手动输入 / 粘贴" ;;
+    *) _ss_from="旧版本迁移" ;;
   esac
-  _ss_tag=""
-  case $_ss_d in
-    "${PENDING:-/nonexistent}"/*) _ss_tag="（本次新加）" ;;
-  esac
-  grep -qxF "$_ss_d" "$WORKDIR/del.list" 2>/dev/null && _ss_tag="（待删除）"
-  printf '  %s) %s%s\n' "$1" "$_ss_name" "$_ss_tag"
-  printf '     %s；域名 %s 个，IP / 网段 %s 个\n' "$_ss_from" "$(($2 + $3))" "$4"
+  printf '  %s) %s  (域名 %s 个，IP/网段 %s 个)\n' "$1" "$_ss_name" "$(($2 + $3))" "$4"
+  say_dim "     $_ss_from"
 }
 
-# 升级前只有一份合并好的 list.txt，把它当成一份名单。
 migrate_sources() {
   [ -d "$CFG/sources" ] && return 0
   [ -s "$CFG/list.txt" ] || return 0
@@ -2066,7 +2516,6 @@ migrate_sources() {
   : >"$CFG/sources/1/origin"
 }
 
-# add_source 来源类型 来源 默认备注名 原文文件
 add_source() {
   _as_id=$(next_source_id)
   _as_d=$PENDING/$_as_id
@@ -2075,8 +2524,9 @@ add_source() {
   summarize_list "$WORKDIR/class.all"
   show_bads "$WORKDIR/class.all"
   summarize_list "$_as_d/list"
-  if [ $((N_DOMAIN + N_SUFFIX + N_IP)) -eq 0 ]; then
-    say_err "这份名单里没有能用的域名或 IP，没有加进去。"
+  _as_dom=$((N_DOMAIN + N_SUFFIX))
+  if [ $((_as_dom + N_IP)) -eq 0 ]; then
+    say_err "没有识别到可用的域名或 IP，未添加。"
     rm -rf "$_as_d"
     return 1
   fi
@@ -2084,10 +2534,21 @@ add_source() {
   printf '%s\n' "$1" >"$_as_d/kind"
   printf '%s\n' "$2" >"$_as_d/origin"
   printf '%s\n' "$3" >"$_as_d/name"
-  say_ok "已添加「$3」：域名 $((N_DOMAIN + N_SUFFIX)) 个，IP / 网段 $N_IP 个"
+  _as_ex=""
+  _as_sd=$(sample_items "$_as_d/list" domain 3)
+  _as_si=$(sample_items "$_as_d/list" ip 2)
+  [ -n "$_as_sd" ] && _as_ex="域名示例：$_as_sd"
+  if [ -n "$_as_si" ]; then
+    _as_ex="${_as_ex:+${_as_ex}；}IP示例：$_as_si"
+  fi
+  say_ok "已添加「${3}」：域名 $_as_dom 个，IP / 网段 $N_IP 个"
+  [ -n "$_as_ex" ] && say_dim "  $_as_ex"
+  if [ "${FW_BACKEND:-}" = none ] && [ "$N_IP" -gt 0 ] && [ "$_as_dom" -eq 0 ]; then
+    say_warn "提醒：当前机器仅支持封域名，这份名单里只有 IP/网段，将无法拦截。"
+  fi
+  return 0
 }
 
-# add_from 网址/路径/-：读入并添加一份名单。
 add_from() {
   _af_src=$(printf '%s' "$1" | sed "s/^[\"']//;s/[\"']\$//")
   case $_af_src in
@@ -2096,247 +2557,99 @@ add_from() {
   read_source "$_af_src" "$WORKDIR/raw.txt" || return 1
   case $_af_src in
     http://*|https://*)
-      # 默认备注名用网址最后一段，例如 AntiAD.list。
-      _af_def=$(printf '%s' "$_af_src" | sed 's/[?#].*//;s|/*$||;s|.*/||')
-      add_source url "$_af_src" "${_af_def:-网址名单}" "$WORKDIR/raw.txt"
+      _af_norm=$(normalize_url "$_af_src")
+      _af_def=$(printf '%s' "$_af_norm" | sed 's/[?#].*//;s|/*$||;s|.*/||')
+      add_source url "$_af_norm" "${_af_def:-在线名单}" "$WORKDIR/raw.txt"
       ;;
-    -) add_source paste "" "标准输入的名单" "$WORKDIR/raw.txt" ;;
+    -) add_source paste "" "标准输入名单" "$WORKDIR/raw.txt" ;;
     *) add_source file "$_af_src" "$(basename "$_af_src")" "$WORKDIR/raw.txt" ;;
   esac
 }
 
+# 直接解析一行用户输入（如 "baidu.com" 或 "baidu.com, qq.com 1.2.3.4"）。
+add_inline() {
+  printf '%s\n' "$1" >"$WORKDIR/raw.txt"
+  _ai_id=$(next_source_id)
+  add_source paste "" "手动添加 $_ai_id" "$WORKDIR/raw.txt"
+}
+
 add_paste() {
   input_init
-  say "请粘贴名单，一行一个。粘贴完后另起一行输入 END 回车（也可以按 Ctrl+D）。"
+  say ""
+  say "请输入或粘贴要封禁的域名 / IP（一行一个，或用空格/逗号隔开均可）："
+  say_dim "  常见写法都能认：baidu.com、*.qq.com、1.2.3.4、1.2.3.0/24、Clash 规则、Hosts 等"
+  say_dim "  全部输入完后，另起一行输入 ok 回车结束（也可以输入 end 或按 Ctrl+D）；首行直接回车返回。"
   : >"$WORKDIR/raw.txt"
   _ap_n=0
   while IFS= read -r _ap_line <&3; do
-    # 从 Windows 终端粘贴时行尾会带 \r 或空格。
-    case $_ap_line in
-      END|end|END[[:space:]]*|end[[:space:]]*|[[:space:]]*END|[[:space:]]*END[[:space:]]*) break ;;
+    _ap_trim=$(printf '%s' "$_ap_line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ "$_ap_n" -eq 0 ] && [ -z "$_ap_trim" ]; then
+      say_info "已返回。"
+      return 1
+    fi
+    _ap_low=$(printf '%s' "$_ap_trim" | tr 'A-Z' 'a-z')
+    case $_ap_low in
+      ok|end|done|完成) break ;;
     esac
     printf '%s\n' "$_ap_line" >>"$WORKDIR/raw.txt"
     _ap_n=$((_ap_n + 1))
     if [ "$_ap_n" -ge 100000 ]; then
-      say_warn "已经收了 100000 行，后面的不再收。这么大的名单建议放成文件或网址。"
+      say_warn "已接收 100000 行上限。超大名单建议保存成文件或用在线链接导入。"
       break
     fi
   done
   if [ "$_ap_n" -eq 0 ]; then
-    say_warn "没有收到内容。"
+    say_warn "没有输入内容。"
     return 1
   fi
-  say_info "收到 $_ap_n 行。"
-  add_source paste "" "粘贴的名单 $(next_source_id)" "$WORKDIR/raw.txt"
+  add_source paste "" "手动添加 $(next_source_id)" "$WORKDIR/raw.txt"
 }
 
-# manage_sources pending|saved：列出名单，改备注名或删除。
-# pending 的直接删；saved 的先标记，回到菜单后确认才真正删。
-manage_sources() {
-  _ms_scope=$1
-  while :; do
-    source_dirs "$_ms_scope" >"$WORKDIR/src.idx"
-    if [ ! -s "$WORKDIR/src.idx" ]; then
-      say_info "还没有名单。"
-      return 0
-    fi
-    say ""
-    say "名单："
-    _ms_i=0
-    while IFS= read -r _ms_d; do
-      _ms_i=$((_ms_i + 1))
-      show_source_line "$_ms_i" "$_ms_d"
-    done <"$WORKDIR/src.idx"
-    ask "输入编号修改或删除，直接回车返回：" ""
-    [ -n "$ANSWER" ] || return 0
-    _ms_d=""
-    case $ANSWER in
-      *[!0-9]*) ;;
-      *) _ms_d=$(sed -n "${ANSWER}p" "$WORKDIR/src.idx") ;;
-    esac
-    if [ -z "$_ms_d" ]; then
-      say_warn "没有这个编号。"
-      continue
-    fi
-    _ms_name=$(cat "$_ms_d/name" 2>/dev/null)
-    _ms_marked=0
-    grep -qxF "$_ms_d" "$WORKDIR/del.list" 2>/dev/null && _ms_marked=1
-    say "「$_ms_name」："
-    say "  1) 改备注名"
-    if [ "$_ms_marked" = 1 ]; then
-      say "  2) 不删了"
-    else
-      say "  2) 删除"
-    fi
-    say "  0) 返回"
-    ask_pick "请选择 [0]: " 0 1 2 0
-    case $ANSWER in
-      1)
-        ask "新的备注名（现在是「$_ms_name」，回车不改）：" ""
-        _ms_new=$(clean_name "$ANSWER")
-        if [ -n "$_ms_new" ]; then
-          printf '%s\n' "$_ms_new" >"$_ms_d/name"
-          say_ok "已改为「$_ms_new」"
-          case $_ms_d in
-            "$CFG"/*) [ -f "$CFG/mode" ] && write_status ;;
-          esac
-        fi
-        ;;
-      2)
-        if [ "$_ms_scope" = pending ]; then
-          rm -rf "$_ms_d"
-          say_ok "已删除「$_ms_name」"
-        elif [ "$_ms_marked" = 1 ]; then
-          grep -vxF "$_ms_d" "$WORKDIR/del.list" >"$WORKDIR/del.tmp"
-          mv "$WORKDIR/del.tmp" "$WORKDIR/del.list"
-          say_ok "「$_ms_name」不删了"
-        else
-          printf '%s\n' "$_ms_d" >>"$WORKDIR/del.list"
-          say_ok "「$_ms_name」已标记删除，返回后确认才生效"
-        fi
-        ;;
-    esac
-  done
-}
-
-# collect_sources new|append：一份份加名单，直到选「下一步」。
-# 追加时一份都没加就返回 1。
-collect_sources() {
-  _cs_mode=$1
-  PENDING=$WORKDIR/sources
-  rm -rf "$PENDING"
-  mkdir -p "$PENDING"
-  while :; do
-    _cs_n=$(source_dirs pending | awk 'END { print NR }')
-    say ""
-    say "添加名单（这次已添加 $_cs_n 份）。一行一个，域名和 IP 可以混着写。"
-    say "  1) 输入名单网址，或这台机器上的文件路径"
-    say "  2) 直接粘贴"
-    [ "$_cs_n" -gt 0 ] && say "  3) 查看、改名或删除这次添加的名单"
-    if [ "$_cs_n" -gt 0 ]; then
-      say "  0) 添加完毕，下一步"
-      _cs_def=0
-    elif [ "$_cs_mode" = append ]; then
-      say "  0) 不追加了，返回"
-      _cs_def=1
-    else
-      say "  按 Ctrl+C 退出"
-      _cs_def=1
-    fi
-    ask "请选择（也可以直接粘贴网址）[$_cs_def]: " "$_cs_def"
-    case $ANSWER in
-      1)
-        ask "名单网址或文件路径（回车返回）：" ""
-        [ -n "$ANSWER" ] && add_from "$ANSWER"
-        ;;
-      2) add_paste ;;
-      3)
-        if [ "$_cs_n" -gt 0 ]; then
-          manage_sources pending
-        else
-          say_warn "请输入菜单上的数字。"
-        fi
-        ;;
-      0)
-        [ "$_cs_n" -gt 0 ] && return 0
-        [ "$_cs_mode" = append ] && return 1
-        say_warn "还没有名单，请先添加一份。"
-        ;;
-      http://*|https://*|/*|"~/"*|./*) add_from "$ANSWER" ;;
-      *)
-        if [ -f "$ANSWER" ]; then
-          add_from "$ANSWER"
-        else
-          say_warn "请输入菜单上的数字，或者名单网址。"
-        fi
-        ;;
-    esac
-  done
-}
-
-# merge_sources 输出：合并所有要生效的名单（已有的减去标记删除的，加上这次新加的）。
+# merge_sources all|pending 输出文件
+# 明确区分「合并全部」与「仅合并本次新加」，修复更换整套名单时残留旧规则的问题。
 merge_sources() {
-  source_dirs all | while IFS= read -r _mg_d; do
-    cat "$_mg_d/list"
-  done | LC_ALL=C sort -u >"$1"
-  cap_list "$1"
+  _ms_scope=$1
+  _ms_out=$2
+  source_dirs "$_ms_scope" | while IFS= read -r _mg_d; do
+    [ -f "$_mg_d/list" ] && cat "$_mg_d/list"
+  done | LC_ALL=C sort -u >"$_ms_out"
+  cap_list "$_ms_out"
+}
+
+preview_source() {
+  _ps_d=$1
+  _ps_name=$(cat "$_ps_d/name" 2>/dev/null)
+  _ps_total=$(count_lines "$_ps_d/list")
+  say ""
+  say "${C_BOLD}「${_ps_name}」内容预览（共 $_ps_total 条，显示前 30 条）：${C_NC}"
+  awk -F '\t' '
+    NR <= 30 {
+      if ($1 == "domain" || $1 == "suffix") printf "  [域名] %s\n", $2
+      else if ($1 ~ /^(ip|net)[46]$/) printf "  [IP]   %s\n", $2
+    }
+  ' "$_ps_d/list"
+  [ "$_ps_total" -gt 30 ] && say_dim "  ... 还有 $((_ps_total - 30)) 条未显示"
 }
 
 #----------------------------------------------------------------------
-# 封禁范围、确认、生效
+# 生效、回滚、状态与实时测试
 #----------------------------------------------------------------------
 
 scope_text() {
   if [ "$1" = all ]; then
-    printf '%s\n' "整台机器"
+    printf '%s\n' "全局封禁（本机及所有代理节点）"
   else
-    printf '%s\n' "只封目标端口 $2"
+    printf '%s\n' "仅封目标端口 ${2}（域名仍全局拦截）"
   fi
 }
 
-# ask_scope [当前范围 当前端口]：结果放在 MODE、PORTS。
-ask_scope() {
-  _sc_def=1
-  [ "${1:-all}" = ports ] && _sc_def=2
-  while :; do
-    say ""
-    say "封在什么范围？"
-    say "  1) 整台机器：不管哪个端口，都连不上名单里的地址（推荐）"
-    say "     想让用你节点上网的人打不开名单里的网站和 App，就选这个。"
-    say "  2) 只封对方网站的某些端口，例如 443。别的端口还能连"
-    say "     注意：这里填的是对方网站的端口，不是你节点的端口。一般用不到。"
-    say "     域名分不了端口：域名在所有端口上都拦，只有名单里直接写的 IP / 网段才按端口封。"
-    ask_pick "请选择 [$_sc_def]: " "$_sc_def" 1 2
-    if [ "$ANSWER" = 1 ]; then
-      MODE=all
-      PORTS=
-      return 0
-    fi
-    while :; do
-      if [ "${1:-}" = ports ] && [ -n "${2:-}" ]; then
-        ask "目标端口，用逗号或空格分开（回车沿用 $2，输入 0 返回）：" "$2"
-      else
-        ask "目标端口，用逗号或空格分开，最多 30 个（输入 0 返回）：" ""
-      fi
-      [ "$ANSWER" = 0 ] && break
-      if [ -z "$ANSWER" ]; then
-        say_warn "请输入端口，例如 443。"
-        continue
-      fi
-      _sc_ports=$(parse_ports "$ANSWER")
-      case $? in
-        0)
-          MODE=ports
-          PORTS=$_sc_ports
-          return 0
-          ;;
-        2) say_err "一次最多 30 个端口。要封更多就选整台机器。" ;;
-        *) say_err "端口不对。请输入 1 到 65535 的数字，例如 80,443。" ;;
-      esac
-    done
-  done
-}
-
-show_plan() {
-  summarize_list "$1"
-  say ""
-  say "即将生效："
-  say "  名单：域名 $((N_DOMAIN + N_SUFFIX)) 个（其中整段后缀 $N_SUFFIX 个），IP / 网段 $N_IP 个"
-  if [ "$FW_BACKEND" = none ]; then
-    say "  方式：只拦域名。这台机器（包括你搭的节点）查不到这些域名，也就打不开这些网站和 App。"
-    [ "$N_IP" -gt 0 ] && say "  名单里的 $N_IP 个 IP / 网段封不了。"
-    [ "$MODE" = all ] || say "  只拦域名时分不了端口，这些域名在所有端口上都会拦。"
-    return 0
-  fi
-  say "  范围：$(scope_text "$MODE" "$PORTS")"
-  if [ "$MODE" = all ]; then
-    say "  域名只在解析这一层拦，不封它解析到的 IP，共用同一个 IP 的网站不会被误伤。"
-    say "  名单里直接写的 IP / 网段照常封。"
-  else
-    say "  域名在解析这一层拦，所有端口都拦（域名分不了端口）；名单里直接写的 IP / 网段只在这些端口上封。"
-  fi
-  say "  只拦这台机器自己发出去的连接，包括代理程序替用户发出的连接。"
-  say "  你的 SSH 来源、本机地址和本机用的 DNS 服务器会自动躲开。"
+dns_method_text() {
+  case $1 in
+    string) printf '%s\n' "防火墙直拦 DNS 查询（不改动系统 DNS，含子域名）" ;;
+    dnsmasq) printf '%s\n' "本地 DNS 过滤（dnsmasq，支持大名单与子域名）" ;;
+    hosts) printf '%s\n' "/etc/hosts 屏蔽（仅覆盖主域名与 www）" ;;
+    *) printf '%s\n' "无（名单中不含域名）" ;;
+  esac
 }
 
 cfg_backup() {
@@ -2352,7 +2665,6 @@ cfg_restore() {
   [ "$HAD_CFG" = 1 ] && cp -R "$WORKDIR/cfg.bak" "$CFG"
 }
 
-# 生成 IP 表和域名表、写防火墙、装开机自启。$1 = setup（可以装软件）或 refresh。
 activate() {
   mkdir -p "$CFG"
   [ -n "${OS_ID:-}" ] || detect_os
@@ -2366,30 +2678,25 @@ activate() {
   printf '%s\n' "$FW_BACKEND" >"$CFG/backend"
   rebuild_ips
   if [ "${1:-setup}" = setup ] && [ "$(cat "$CFG/dns.method")" = dnsmasq ]; then
-    # dnsmasq 接好后要查一次确认它真的能回答，没查 DNS 的命令就装一个。
     ensure_resolver setup
   fi
   if [ ! -s "$CFG/v4" ] && [ ! -s "$CFG/v6" ] && [ "$(cat "$CFG/dns.method")" = none ]; then
-    [ "$FW_BACKEND" = none ] && die "这台机器只能拦域名，但名单里没有域名（IP / 网段封不了）。"
-    die "没有可以封的地址。"
+    [ "$FW_BACKEND" = none ] && die "当前机器只能封域名，但名单里没有任何域名（IP/网段在此环境下无法拦截）。"
+    die "名单里没有可生效的域名或 IP（可能全部触发了防误封跳过）。"
   fi
   load_rules 1 || exit 1
   printf '%s\n' 1 >"$CFG/enabled"
   write_status
-  # 定时刷新时不用每次重写开机服务。
   [ "${1:-setup}" = setup ] && install_persistence
   return 0
 }
 
-# apply_changes 名单方式 合并后的名单：写进配置并生效。
-# 名单方式：new 换一套、append 追加、delete 删掉标记的、keep 名单不变。
-# 失败时把配置和规则都恢复成原来的样子。
+# apply_changes new|append|delete|keep [合并后的 list 文件]
 apply_changes() {
   cfg_backup
   mkdir -p "$CFG"
   case $1 in
     new|append)
-      # resolved.last 是旧版本留下的域名解析结果，新版本不再解析域名，换名单时顺手清掉。
       [ "$1" = new ] && rm -rf "$CFG/sources" "$CFG/resolved.last"
       mkdir -p "$CFG/sources"
       for _ac_d in "$PENDING"/*; do
@@ -2400,25 +2707,50 @@ apply_changes() {
       ;;
     delete)
       while IFS= read -r _ac_d; do
-        rm -rf "$_ac_d"
+        [ -n "$_ac_d" ] && rm -rf "$_ac_d"
       done <"$WORKDIR/del.list"
       : >"$WORKDIR/del.list"
+      ;;
+    update)
+      # 把暂存的在线名单更新写回正式目录（在 cfg_backup 之后，失败可完整回滚）
+      for _ac_u in "$WORKDIR/upd_stage"/*; do
+        [ -d "$_ac_u" ] || continue
+        _ac_id=${_ac_u##*/}
+        if [ -d "$CFG/sources/$_ac_id" ]; then
+          cp "$_ac_u/list" "$CFG/sources/$_ac_id/list"
+          cp "$_ac_u/count" "$CFG/sources/$_ac_id/count"
+        fi
+      done
+      rm -rf "$WORKDIR/upd_stage"
       ;;
   esac
   [ -n "${2:-}" ] && cat "$2" >"$CFG/list.txt"
   printf '%s\n' "$MODE" >"$CFG/mode"
   printf '%s\n' "$PORTS" >"$CFG/ports"
-  # 放进子 shell：里面任何一步 die，都只退出子 shell，这里接着恢复。
+  say ""
+  say_info "正在应用封禁规则，请稍候..."
   if (activate setup); then
-    if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
-      say_ok "已经生效（只拦域名）。"
-      say "  如果用节点还能打开名单里的网站，重启一下节点程序，让它重新读这台机器的 DNS 设置。"
+    _ac_v4=$(count_lines "$CFG/v4")
+    _ac_v6=$(count_lines "$CFG/v6")
+    _ac_dn=$(count_lines "$CFG/dns.list")
+    _ac_be=$(cat "$CFG/backend" 2>/dev/null)
+    _ac_pok=$(cat "$WORKDIR/persist.ok" 2>/dev/null || echo 1)
+    say ""
+    if [ "$_ac_be" = none ]; then
+      say_ok "封禁已生效（仅封禁域名模式：$_ac_dn 个域名）"
+      say_dim "  • 若代理节点此前已运行，建议重启一次节点程序让它使用新的 DNS。"
+      say_dim "  • 受限容器重启后若未自动生效，运行 vps-fengjin on 即可恢复。"
     else
-      say_ok "已经生效。重启后会自动封上，每 6 小时还会自动重新封一次。"
+      say_ok "封禁已生效！已拦截 $_ac_dn 个域名、$((_ac_v4 + _ac_v6)) 条 IP/网段。"
+      if [ "$_ac_pok" = 1 ]; then
+        say_dim "  • 已配置开机自启，并每 6 小时自动巡检，防止被其他防火墙冲掉。"
+      else
+        say_dim "  • 当前环境无开机自启服务，重启后运行 vps-fengjin on 即可恢复。"
+      fi
     fi
     return 0
   fi
-  say_err "没有生效，正在恢复原来的设置……"
+  say_err "规则生效失败，正在自动还原修改前的配置..."
   hosts_clear
   dnsmasq_clear
   cfg_restore
@@ -2428,218 +2760,800 @@ apply_changes() {
   else
     remove_firewall
   fi
-  say_info "已恢复成修改前的样子。"
+  say_info "已完整恢复到操作前的状态，没有产生破坏。"
   return 1
 }
-
-confirm_or_cancel() {
-  [ "${OPT_YES:-0}" = 1 ] && return 0
-  if ask_yn "确认生效？[y/N]: " n; then
-    return 0
-  fi
-  say_info "已取消，什么都没改。"
-  return 1
-}
-
-#----------------------------------------------------------------------
-# 状态
-#----------------------------------------------------------------------
 
 write_status() {
   [ -n "${OS_PRETTY:-}" ] || detect_os
   _ws_method=$(cat "$CFG/dns.method" 2>/dev/null || echo none)
+  _ws_be=$(cat "$CFG/backend" 2>/dev/null || echo none)
   summarize_list "$CFG/list.txt"
   {
     if [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ]; then
-      printf '%s\n' "状态：开着"
+      printf '%s\n' "状态：运行中"
     else
-      printf '%s\n' "状态：关着"
+      printf '%s\n' "状态：已暂停（名单保留）"
     fi
     printf '系统：%s\n' "${OS_PRETTY:-未知}"
-    if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
-      printf '%s\n' "方式：只拦域名（这台机器不能改防火墙，所有端口都拦）"
+    if [ "$_ws_be" = none ]; then
+      printf '%s\n' "范围：全局封禁（受限环境：仅拦截域名）"
     else
       printf '范围：%s\n' "$(scope_text "$(cat "$CFG/mode" 2>/dev/null)" "$(cat "$CFG/ports" 2>/dev/null)")"
     fi
-    printf '名单：域名 %s 个（其中整段后缀 %s 个），IP / 网段 %s 个\n' "$((N_DOMAIN + N_SUFFIX))" "$N_SUFFIX" "$N_IP"
+    printf '名单总计：域名 %s 个，IP / 网段 %s 个\n' "$((N_DOMAIN + N_SUFFIX))" "$N_IP"
     source_dirs saved >"$WORKDIR/status.idx"
     _ws_i=0
     while IFS= read -r _ws_d; do
       _ws_i=$((_ws_i + 1))
-      show_source_line "$_ws_i" "$_ws_d"
+      _ws_n=$(cat "$_ws_d/name" 2>/dev/null)
+      _ws_o=$(cat "$_ws_d/origin" 2>/dev/null)
+      set -- $(cat "$_ws_d/count" 2>/dev/null) 0 0 0
+      case $(cat "$_ws_d/kind" 2>/dev/null) in
+        url) _ws_f="在线链接 $_ws_o" ;;
+        file) _ws_f="本地文件 $_ws_o" ;;
+        paste) _ws_f="手动输入" ;;
+        *) _ws_f="旧版本迁移" ;;
+      esac
+      printf '  %s) %s（域名 %s，IP %s | %s）\n' "$_ws_i" "$_ws_n" "$(($1 + $2))" "$3" "$_ws_f"
     done <"$WORKDIR/status.idx"
-    if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
-      printf '%s\n' "IP / 网段：封不了（这台机器不能改防火墙）"
+    if [ "$_ws_be" = none ]; then
+      printf '%s\n' "防火墙：不可用（仅拦截域名）"
     else
-      printf '实际封住的地址：IPv4 %s 条，IPv6 %s 条\n' "$(count_lines "$CFG/v4")" "$(count_lines "$CFG/v6")"
+      printf '已生效 IP：IPv4 %s 条，IPv6 %s 条（后端：%s）\n' \
+        "$(count_lines "$CFG/v4")" "$(count_lines "$CFG/v6")" "$_ws_be"
     fi
-    case $_ws_method in
-      string) printf '%s\n' "域名拦截：拦发往 53 端口的域名查询，不改本机 DNS 设置" ;;
-      dnsmasq) printf '%s\n' "域名拦截：dnsmasq 把这些域名回成“不存在”" ;;
-      hosts) printf '%s\n' "域名拦截：写入 /etc/hosts，子域名拦不住" ;;
-      *) printf '%s\n' "域名拦截：没有，只封 IP" ;;
-    esac
-    printf '版本：%s\n' "$VERSION"
+    printf '域名拦截：%s\n' "$(dns_method_text "$_ws_method")"
+    printf '脚本版本：%s\n' "$VERSION"
   } >"$CFG/status.txt"
+}
+
+# 实时巡检规则状态。输出给菜单和 status 共用。
+# 返回 0=正常，1=暂停，2=防火墙缺失，3=DNS 拦截异常
+check_health() {
+  if [ "$(cat "$CFG/enabled" 2>/dev/null)" != 1 ]; then
+    return 1
+  fi
+  [ "$(id -u)" = 0 ] || return 0
+  _ch_be=$(cat "$CFG/backend" 2>/dev/null)
+  _ch_dm=$(cat "$CFG/dns.method" 2>/dev/null)
+  if [ "$_ch_be" = none ]; then
+    [ "$_ch_dm" = none ] && return 0
+    dns_live && return 0
+    return 3
+  fi
+  if [ -s "$CFG/v4" ] || [ -s "$CFG/v6" ] || [ "$_ch_dm" = string ]; then
+    rules_live || return 2
+  fi
+  case $_ch_dm in
+    dnsmasq|hosts)
+      dns_live || return 3
+      ;;
+  esac
+  return 0
 }
 
 show_status() {
   if [ ! -f "$CFG/status.txt" ]; then
-    say_info "这台机器还没有封禁记录。"
+    say_info "这台服务器还没有配置封禁名单。"
     return 0
   fi
   cat "$CFG/status.txt"
   [ "$(id -u)" = 0 ] && [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ] || return 0
-  if [ "$(cat "$CFG/backend" 2>/dev/null)" = none ]; then
-    [ "$(cat "$CFG/dns.method" 2>/dev/null)" = none ] && return 0
-    if rules_live; then
-      say "域名拦截：在运行"
-    else
-      say_warn "域名拦截没在运行（机器或容器重启过？）。运行 vps-fengjin on 重新生效。"
-    fi
+  check_health
+  case $? in
+    0) say_ok "实时检查：所有封禁规则均在正常运行" ;;
+    2) say_warn "实时检查：防火墙规则缺失（可能被 UFW/firewalld 重载清掉），请运行 vps-fengjin refresh 恢复" ;;
+    3) say_warn "实时检查：域名拦截未运行或系统 DNS 被重置，请运行 vps-fengjin on 恢复" ;;
+  esac
+}
+
+# 主菜单顶部的精简状态面板（控制在 6 行以内，一眼看清）。
+show_dashboard() {
+  ui_banner
+  _db_en=$(cat "$CFG/enabled" 2>/dev/null || echo 0)
+  _db_be=$(cat "$CFG/backend" 2>/dev/null || echo none)
+  _db_dm=$(cat "$CFG/dns.method" 2>/dev/null || echo none)
+  _db_mode=$(cat "$CFG/mode" 2>/dev/null || echo all)
+  _db_ports=$(cat "$CFG/ports" 2>/dev/null)
+  _db_sc=$(count_sources saved)
+  _db_dn=$(count_lines "$CFG/dns.list")
+  _db_ip=$(( $(count_lines "$CFG/v4") + $(count_lines "$CFG/v6") ))
+
+  if [ "$_db_en" = 1 ]; then
+    check_health
+    case $? in
+      0) say "  运行状态：${C_GREEN}● 运行中（一切正常）${C_NC}" ;;
+      2) say "  运行状态：${C_YELLOW}! 防火墙规则缺失（选 4 可立即恢复）${C_NC}" ;;
+      3) say "  运行状态：${C_YELLOW}! 域名拦截异常（选 4 可立即恢复）${C_NC}" ;;
+    esac
   else
-    _ss_method=$(cat "$CFG/dns.method" 2>/dev/null)
-    if [ -s "$CFG/v4" ] || [ -s "$CFG/v6" ] || [ "$_ss_method" = string ]; then
-      if rules_live; then
-        say "防火墙规则：在"
-      else
-        say_warn "防火墙规则不在了，可能被别的防火墙重载清掉。运行 vps-fengjin refresh 重新封上。"
+    say "  运行状态：${C_YELLOW}○ 已暂停（名单已保留，选 5 随时开启）${C_NC}"
+  fi
+  if [ "$_db_be" = none ]; then
+    say "  封禁范围：全局（仅封域名模式）"
+  else
+    say "  封禁范围：$(scope_text "$_db_mode" "$_db_ports")"
+  fi
+  say "  当前名单：${_db_sc} 份（已生效域名 ${_db_dn} 个，IP/网段 ${_db_ip} 条）"
+  say "  域名方式：$(dns_method_text "$_db_dm")"
+  ui_hr
+}
+
+# 实测某个域名或 IP 是否命中名单并已被拦住。
+cmd_test() {
+  _ct_target=$1
+  if [ ! -f "$CFG/list.txt" ]; then
+    say_info "还没有配置任何封禁名单，无法测试。"
+    return 1
+  fi
+  _ct_res=$(fengjin_awk match plan="$CFG" target="$_ct_target")
+  _ct_kind=$(printf '%s' "$_ct_res" | awk -F '\t' '{ print $1 }')
+  _ct_val=$(printf '%s' "$_ct_res" | awk -F '\t' '{ print $2 }')
+  _ct_en=$(cat "$CFG/enabled" 2>/dev/null || echo 0)
+  _ct_dm=$(cat "$CFG/dns.method" 2>/dev/null || echo none)
+  _ct_be=$(cat "$CFG/backend" 2>/dev/null || echo none)
+
+  say ""
+  case $_ct_kind in
+    invalid)
+      say_err "「${_ct_target}」不是有效的网站域名或 IP 地址。"
+      return 1
+      ;;
+    none)
+      say_warn "未命中封禁名单：「${_ct_val}」不在你已添加的规则中，当前不会被本脚本拦截。"
+      return 0
+      ;;
+    v4|v6)
+      say_ok "命中名单中的 IP 规则：$_ct_val"
+      if [ "$_ct_be" = none ]; then
+        say_warn "但当前机器无防火墙权限（仅封域名模式），该 IP 无法被拦截。"
+        return 0
       fi
+      if [ "$_ct_en" != 1 ]; then
+        say_warn "当前封禁处于「已暂停」状态，不会生效。选「开启封禁」即可恢复。"
+        return 0
+      fi
+      if rules_live; then
+        say_ok "防火墙规则正在运行，该 IP 已被拦截！"
+      else
+        say_warn "防火墙规则当前缺失，请运行「立即重新生效」修复！"
+      fi
+      ;;
+    domain_exact|domain_sub)
+      say_ok "命中名单中的域名规则：$_ct_val"
+      if [ "$_ct_en" != 1 ]; then
+        say_warn "当前封禁处于「已暂停」状态，不会生效。选「开启封禁」即可恢复。"
+        return 0
+      fi
+      _ct_host=$(printf '%s' "$_ct_target" | sed 's|^[A-Za-z][A-Za-z0-9+.-]*://||;s|[/?#].*$||;s|:[0-9]*$||' | tr 'A-Z' 'a-z')
+      _ct_host=${_ct_host#\*.}; _ct_host=${_ct_host#+.}; _ct_host=${_ct_host#.}; _ct_host=${_ct_host%.}
+      if [ "$_ct_dm" = hosts ]; then
+        if ! awk -v h="$_ct_host" '{ for (i = 2; i <= NF; i++) if (tolower($i) == h) f = 1 } END { exit !f }' /etc/hosts 2>/dev/null; then
+          say_warn "当前为 /etc/hosts 降级模式，该域名（${_ct_host}）未写入 /etc/hosts，可能无法拦截。"
+          return 0
+        fi
+        say_dim "  正在本机实测解析 ${_ct_host}（/etc/hosts 模式）..."
+        _ct_got=$(resolve_system "$_ct_host" hosts)
+      else
+        say_dim "  正在本机实测 DNS 解析 $_ct_host ..."
+        _ct_got=$(resolve_system "$_ct_host")
+      fi
+      _ct_blocked=1
+      for _ct_ip in $_ct_got; do
+        case $_ct_ip in
+          0.0.0.0|::) ;;
+          *) _ct_blocked=0 ;;
+        esac
+      done
+      if [ "$_ct_blocked" = 1 ]; then
+        say_ok "实测结果：已被成功拦截！（无法解析或已指向屏蔽地址）"
+      else
+        say_warn "实测注意：本机仍解析到了 IP（$(printf '%s' "$_ct_got" | tr '\n' ' ')）"
+        say_dim "  可能原因：规则被其他防火墙清掉 / 系统 DNS 缓存未过期 / 机器走了加密 DNS。"
+        say_dim "  建议：执行「立即重新生效」后再试一次。"
+      fi
+      ;;
+  esac
+}
+
+#----------------------------------------------------------------------
+# 小白友好交互向导
+#----------------------------------------------------------------------
+
+# 处理用户在添加名单提示处直接输入的内容（链接 / 本地文件 / 域名 / IP）。
+handle_direct_input() {
+  _hdi_val=$(printf '%s' "$1" | sed "s/^[\"']//;s/[\"']\$//")
+  case $_hdi_val in
+    http://*|https://*|/*|"~/"*|./*)
+      add_from "$_hdi_val"
+      ;;
+    *[!0-9]*)
+      if [ -f "$_hdi_val" ]; then
+        add_from "$_hdi_val"
+      else
+        add_inline "$_hdi_val"
+      fi
+      ;;
+    *)
+      say_warn "没有这个选项，请输入菜单上的数字（也可直接输入域名或粘贴网址）。"
+      ;;
+  esac
+}
+
+# 统一添加名单向导：支持直接输入域名/IP、粘贴网址、导入文件、批量粘贴。
+# 参数 $1 = step_title（步骤标题），$2 = keep 时保留已暂存的名单（从核对页返回时用）。
+# 返回 0 表示用户点击了「下一步」且至少有 1 份名单；返回 1 表示用户取消。
+wizard_add_sources() {
+  _wa_title=$1
+  PENDING=$WORKDIR/sources
+  if [ "${2:-}" != keep ]; then
+    rm -rf "$PENDING"
+  fi
+  mkdir -p "$PENDING"
+  say_step "$_wa_title"
+  while :; do
+    _wa_n=$(count_sources pending)
+    if [ "$_wa_n" -eq 0 ]; then
+      say ""
+      say "请选择添加方式（域名、IP、网段可以混着写）："
+      say "  1) 手动输入或批量粘贴网站 / IP ${C_GREEN}（推荐，最简单）${C_NC}"
+      say "  2) 导入在线名单链接（如 GitHub / Clash / AdGuard / Hosts 规则链接）"
+      say "  3) 导入服务器上的本地文件（如 /root/block.txt）"
+      say "  0) 取消并返回"
+      say_dim "  小技巧：也可以直接在这里输入域名（如 baidu.com）或直接粘贴网址回车！"
+      ask "请输入选项，或直接输入域名 / 链接 [1]: " "1"
+      case $ANSWER in
+        0) return 1 ;;
+        1) add_paste ;;
+        2)
+          ask "请粘贴在线名单链接（http/https，回车返回）：" ""
+          [ -n "$ANSWER" ] && add_from "$ANSWER"
+          ;;
+        3)
+          ask "请输入服务器文件路径（如 /root/list.txt，回车返回）：" ""
+          [ -n "$ANSWER" ] && add_from "$ANSWER"
+          ;;
+        *) handle_direct_input "$ANSWER" ;;
+      esac
+    else
+      merge_sources pending "$WORKDIR/pending.preview"
+      summarize_list "$WORKDIR/pending.preview"
+      say ""
+      say "${C_BOLD}本次已添加 ${_wa_n} 份名单（共 $((N_DOMAIN + N_SUFFIX)) 个域名，${N_IP} 个 IP/网段）：${C_NC}"
+      say "  1) 下一步：核对并生效 ${C_GREEN}（推荐，直接回车）${C_NC}"
+      say "  2) 继续添加更多网站 / 链接 / 文件"
+      say "  3) 查看、重命名或删掉刚加的名单"
+      say "  0) 取消本次添加（不改动当前系统）"
+      ask "请选择（也可继续直接输入域名或粘贴网址）[1]: " "1"
+      case $ANSWER in
+        1) return 0 ;;
+        2)
+          say ""
+          say "  1) 手动输入或批量粘贴网站 / IP"
+          say "  2) 导入在线名单链接（http/https）"
+          say "  3) 导入服务器本地文件"
+          say "  0) 返回"
+          ask "请选择添加方式 [1]: " "1"
+          case $ANSWER in
+            1) add_paste ;;
+            2)
+              ask "请粘贴在线名单链接（回车返回）：" ""
+              [ -n "$ANSWER" ] && add_from "$ANSWER"
+              ;;
+            3)
+              ask "请输入服务器文件路径（回车返回）：" ""
+              [ -n "$ANSWER" ] && add_from "$ANSWER"
+              ;;
+            0) ;;
+            *) handle_direct_input "$ANSWER" ;;
+          esac
+          ;;
+        3) manage_pending_sources ;;
+        0)
+          if ask_yn "确定放弃刚才添加的 ${_wa_n} 份名单吗？[y/N]: " n; then
+            rm -rf "$PENDING"
+            return 1
+          fi
+          ;;
+        *) handle_direct_input "$ANSWER" ;;
+      esac
     fi
-    # 域名只靠 dnsmasq / hosts 拦时（名单里只有域名时常见），也要看它还在不在。
-    case $_ss_method in
-      dnsmasq|hosts)
-        if dns_live; then
-          say "域名拦截：在运行"
+  done
+}
+
+# 管理「本次刚加、尚未生效」的名单。
+manage_pending_sources() {
+  while :; do
+    source_dirs pending >"$WORKDIR/pend.idx"
+    if [ ! -s "$WORKDIR/pend.idx" ]; then
+      say_info "本次待添加名单已清空。"
+      return 0
+    fi
+    say ""
+    say "本次已添加的名单："
+    _mp_i=0
+    while IFS= read -r _mp_d; do
+      _mp_i=$((_mp_i + 1))
+      show_source_line "$_mp_i" "$_mp_d"
+    done <"$WORKDIR/pend.idx"
+    ask "输入编号查看/改名/删除，直接回车返回：" ""
+    [ -n "$ANSWER" ] || return 0
+    _mp_d=""
+    case $ANSWER in
+      *[!0-9]*) ;;
+      *) _mp_d=$(sed -n "${ANSWER}p" "$WORKDIR/pend.idx") ;;
+    esac
+    if [ -z "$_mp_d" ]; then
+      say_warn "没有这个编号。"
+      continue
+    fi
+    _mp_name=$(cat "$_mp_d/name" 2>/dev/null)
+    say ""
+    say "「${_mp_name}」："
+    say "  1) 预览名单里的内容"
+    say "  2) 修改备注名"
+    say "  3) 删除这份名单"
+    say "  0) 返回"
+    ask_pick "请选择 [0]: " 0 1 2 3 0
+    case $ANSWER in
+      1) preview_source "$_mp_d" ;;
+      2)
+        ask "新的备注名（原名「${_mp_name}」，回车不改）：" ""
+        _mp_new=$(clean_name "$ANSWER")
+        if [ -n "$_mp_new" ]; then
+          printf '%s\n' "$_mp_new" >"$_mp_d/name"
+          say_ok "已改名为「${_mp_new}」"
+        fi
+        ;;
+      3)
+        rm -rf "$_mp_d"
+        say_ok "已删除「${_mp_name}」"
+        ;;
+    esac
+  done
+}
+
+# 高级选项：修改封禁范围。返回 0=已选，1=取消返回。
+ask_scope() {
+  _sc_cur_mode=${1:-all}
+  _sc_cur_ports=${2:-}
+  _sc_def=1
+  [ "$_sc_cur_mode" = ports ] && _sc_def=2
+  while :; do
+    say ""
+    say "请选择封禁范围："
+    say "  1) 全局封禁：所有端口全部拦住 ${C_GREEN}（推荐，99% 的人选这个）${C_NC}"
+    say_dim "     想让服务器和代理节点彻底打不开名单里的网站/App，就选 1。"
+    say "  2) 仅封指定目标端口（高级，一般用不到）"
+    say_dim "     注意：这里填的是【对方网站】的端口（例如 80,443），不是你代理节点的端口！"
+    say_dim "     并且只对名单里的 IP/网段生效；域名不分端口，依然全局拦截。"
+    say "  0) 返回（保持不变）"
+    ask_pick "请选择 [$_sc_def]: " "$_sc_def" 1 2 0
+    [ "$ANSWER" = 0 ] && return 1
+    if [ "$ANSWER" = 1 ]; then
+      MODE=all
+      PORTS=
+      return 0
+    fi
+    while :; do
+      if [ "$_sc_cur_mode" = ports ] && [ -n "$_sc_cur_ports" ]; then
+        ask "请输入要封的目标端口（逗号或空格隔开，回车沿用 ${_sc_cur_ports}，输入 0 返回）：" "$_sc_cur_ports"
+      else
+        ask "请输入要封的目标端口（例如 80,443，最多 30 个，输入 0 返回）：" ""
+      fi
+      [ "$ANSWER" = 0 ] && break
+      if [ -z "$ANSWER" ]; then
+        say_warn "请输入端口号，例如 443。"
+        continue
+      fi
+      _sc_ports=$(parse_ports "$ANSWER")
+      case $? in
+        0)
+          MODE=ports
+          PORTS=$_sc_ports
+          return 0
+          ;;
+        2) say_err "一次最多填写 30 个端口。如需封更多端口，建议直接选「全局封禁」。" ;;
+        *) say_err "端口格式不对，请填写 1~65535 的数字，例如 80,443。" ;;
+      esac
+    done
+  done
+}
+
+show_plan_summary() {
+  summarize_list "$1"
+  _sp_dom=$((N_DOMAIN + N_SUFFIX))
+  _sp_sd=$(sample_items "$1" domain 3)
+  _sp_si=$(sample_items "$1" ip 3)
+  say ""
+  say "${C_BOLD}即将生效的封禁配置：${C_NC}"
+  if [ "$_sp_dom" -gt 0 ]; then
+    say "  • 封禁域名：${_sp_dom} 个${_sp_sd:+（含 ${_sp_sd}）}"
+  else
+    say "  • 封禁域名：0 个"
+  fi
+  if [ "$FW_BACKEND" = none ]; then
+    if [ "$N_IP" -gt 0 ]; then
+      say "  • IP / 网段：${N_IP} 个 ${C_YELLOW}（当前受限容器无防火墙权限，IP 将跳过）${C_NC}"
+    fi
+    say "  • 拦截方式：仅拦截域名（含子域名），本机及代理节点均生效"
+  else
+    if [ "$N_IP" -gt 0 ]; then
+      say "  • IP / 网段：${N_IP} 个${_sp_si:+（含 ${_sp_si}）}"
+    else
+      say "  • IP / 网段：0 个"
+    fi
+    say "  • 生效范围：$(scope_text "$MODE" "$PORTS")"
+    say "  • 域名处理：仅拦截 DNS 解析（含子域名），不会误伤同 IP 的其他网站"
+    say "  • 安全保护：自动跳过你的 SSH 登录 IP、本机地址和系统 DNS，不会失联"
+  fi
+}
+
+# 核对并生效：给用户「生效 / 返回改名单 / 高级改范围 / 取消」完整选择。
+# $1 = new|append, $2 = step_title
+wizard_confirm_loop() {
+  _wc_how=$1
+  _wc_title=$2
+  while :; do
+    if [ "$_wc_how" = new ]; then
+      merge_sources pending "$WORKDIR/merged.txt"
+    else
+      merge_sources all "$WORKDIR/merged.txt"
+    fi
+    say_step "$_wc_title"
+    show_plan_summary "$WORKDIR/merged.txt"
+    say ""
+    say "  1) 确认无误，立即生效 ${C_GREEN}（推荐，直接回车）${C_NC}"
+    say "  2) 返回修改刚添加的名单"
+    if [ "$FW_BACKEND" != none ]; then
+      say "  3) 修改封禁范围（高级，默认全局一般不用改）"
+    fi
+    say "  0) 取消，不做任何改动"
+    ask "请选择 [1]: " "1"
+    case $ANSWER in
+      1|y|Y|yes|YES|是|确认)
+        apply_changes "$_wc_how" "$WORKDIR/merged.txt"
+        return $?
+        ;;
+      2)
+        return 2
+        ;;
+      3)
+        if [ "$FW_BACKEND" != none ]; then
+          ask_scope "$MODE" "$PORTS" || true
         else
-          say_warn "域名拦截没在运行（机器或容器重启过？）。运行 vps-fengjin on 重新生效。"
+          say_warn "当前机器仅支持封禁域名，不支持按端口设置。"
+        fi
+        ;;
+      0|n|N|no|NO|取消)
+        rm -rf "${PENDING:-}"
+        say_info "已取消，未做任何改动。"
+        return 1
+        ;;
+      *)
+        say_warn "请输入 1、2$([ "$FW_BACKEND" != none ] && echo "、3") 或 0。"
+        ;;
+    esac
+  done
+}
+
+# 首次安装完整 2 步向导
+flow_first_setup() {
+  [ -n "${OS_PRETTY:-}" ] || detect_os
+  _in_kb=$(mem_total_kb)
+  ui_banner
+  say "作用：禁止这台服务器（含上面搭建的代理节点）访问指定网站或 IP。"
+  say "系统：${OS_PRETTY}  |  内存：$([ "$_in_kb" -gt 0 ] && echo "$((_in_kb / 1024)) MB" || echo 未知)"
+  say ""
+  say_info "正在自动检测服务器环境..."
+  fw_precheck
+  fw_summary_line
+  MODE=all
+  PORTS=
+  PENDING=$WORKDIR/sources
+  rm -rf "$PENDING"
+  mkdir -p "$PENDING"
+  while :; do
+    wizard_add_sources "第 1 步 / 共 2 步：你要封禁哪些网站或 IP？" keep || {
+      say_info "已退出设置，未对系统做任何改动。"
+      return 1
+    }
+    wizard_confirm_loop new "第 2 步 / 共 2 步：核对并立即生效"
+    _fs_rc=$?
+    [ "$_fs_rc" -eq 2 ] && continue
+    return $_fs_rc
+  done
+}
+
+# 菜单 1：追加封禁
+flow_append() {
+  fw_precheck
+  MODE=$(cat "$CFG/mode" 2>/dev/null || echo all)
+  PORTS=$(cat "$CFG/ports" 2>/dev/null)
+  PENDING=$WORKDIR/sources
+  rm -rf "$PENDING"
+  mkdir -p "$PENDING"
+  while :; do
+    wizard_add_sources "添加新的封禁网站 / IP / 名单" keep || return 0
+    wizard_confirm_loop append "核对合并后的封禁配置"
+    _fa_rc=$?
+    [ "$_fa_rc" -eq 2 ] && continue
+    return 0
+  done
+}
+
+# 菜单 6：更换整套名单（先告知影响、可随时取消、只合并本次新加！）
+flow_replace() {
+  fw_precheck
+  _fr_old=$(count_sources saved)
+  say ""
+  say_warn "注意：更换整套名单会用你接下来新加的名单，替换掉现有的 ${_fr_old} 份旧名单。"
+  say_dim "  在最后一步确认之前，随时可以按 0 取消，原封禁规则不受影响。"
+  ask_yn "继续更换整套名单吗？[y/N]: " n || return 0
+  MODE=$(cat "$CFG/mode" 2>/dev/null || echo all)
+  PORTS=$(cat "$CFG/ports" 2>/dev/null)
+  [ "$MODE" = ports ] || { MODE=all; PORTS=; }
+  PENDING=$WORKDIR/sources
+  rm -rf "$PENDING"
+  mkdir -p "$PENDING"
+  while :; do
+    wizard_add_sources "更换整套名单：请添加新的封禁内容" keep || return 0
+    wizard_confirm_loop new "核对新名单并替换生效"
+    _fr_rc=$?
+    [ "$_fr_rc" -eq 2 ] && continue
+    return 0
+  done
+}
+
+# 重新下载某一份在线链接/本地文件名单，暂存到 $WORKDIR/upd_stage/<id>/，生效失败可完整回滚。
+# 返回 0=有更新（已暂存），1=失败，2=已是最新无需更新
+refresh_single_source() {
+  _rs_d=$1
+  _rs_id=${_rs_d##*/}
+  _rs_name=$(cat "$_rs_d/name" 2>/dev/null)
+  _rs_kind=$(cat "$_rs_d/kind" 2>/dev/null)
+  _rs_origin=$(cat "$_rs_d/origin" 2>/dev/null)
+  case $_rs_kind in
+    url|file) ;;
+    *)
+      say_info "「${_rs_name}」是手动输入的名单，没有来源链接可更新。"
+      return 1
+      ;;
+  esac
+  say_info "正在更新「${_rs_name}」($_rs_origin)..."
+  read_source "$_rs_origin" "$WORKDIR/upd.raw" || return 1
+  classify_raw "$WORKDIR/upd.raw" "$WORKDIR/upd.list"
+  summarize_list "$WORKDIR/upd.list"
+  _rs_new_dom=$((N_DOMAIN + N_SUFFIX))
+  _rs_new_ip=$N_IP
+  if [ $((_rs_new_dom + _rs_new_ip)) -eq 0 ]; then
+    say_err "更新后的名单为空或无法识别，已保留原名单。"
+    return 1
+  fi
+  set -- $(cat "$_rs_d/count" 2>/dev/null) 0 0 0
+  _rs_old_dom=$(($1 + $2))
+  _rs_old_ip=$3
+  if cmp -s "$WORKDIR/upd.list" "$_rs_d/list" 2>/dev/null; then
+    say_ok "「${_rs_name}」已是最新内容（域名 $_rs_new_dom 个，IP $_rs_new_ip 个），无需变动。"
+    return 2
+  fi
+  mkdir -p "$WORKDIR/upd_stage/$_rs_id"
+  cp "$WORKDIR/upd.list" "$WORKDIR/upd_stage/$_rs_id/list"
+  printf '%s %s %s\n' "$N_DOMAIN" "$N_SUFFIX" "$N_IP" >"$WORKDIR/upd_stage/$_rs_id/count"
+  say_ok "「${_rs_name}」发现更新：域名 ${_rs_old_dom} → ${_rs_new_dom} 个，IP ${_rs_old_ip} → ${_rs_new_ip} 个"
+  return 0
+}
+
+# 合并已保存名单，若某份名单在 upd_stage 里有更新则用更新后的版本。
+merge_with_updates() {
+  source_dirs saved | while IFS= read -r _mu_d; do
+    _mu_id=${_mu_d##*/}
+    if [ -f "$WORKDIR/upd_stage/$_mu_id/list" ]; then
+      cat "$WORKDIR/upd_stage/$_mu_id/list"
+    elif [ -f "$_mu_d/list" ]; then
+      cat "$_mu_d/list"
+    fi
+  done | LC_ALL=C sort -u >"$1"
+  cap_list "$1"
+}
+
+update_all_url_sources() {
+  rm -rf "$WORKDIR/upd_stage"
+  _ua_found=0
+  _ua_changed=0
+  source_dirs saved >"$WORKDIR/upd.idx"
+  while IFS= read -r _ua_d; do
+    [ "$(cat "$_ua_d/kind" 2>/dev/null)" = url ] || continue
+    _ua_found=$((_ua_found + 1))
+    refresh_single_source "$_ua_d"
+    [ $? -eq 0 ] && _ua_changed=$((_ua_changed + 1))
+  done <"$WORKDIR/upd.idx"
+  if [ "$_ua_found" -eq 0 ]; then
+    say_info "当前没有通过「在线链接」导入的名单。"
+    return 0
+  fi
+  if [ "$_ua_changed" -eq 0 ]; then
+    say_ok "全部 ${_ua_found} 份在线名单均已是最新。"
+    return 0
+  fi
+  merge_with_updates "$WORKDIR/merged.txt"
+  MODE=$(cat "$CFG/mode" 2>/dev/null || echo all)
+  PORTS=$(cat "$CFG/ports" 2>/dev/null)
+  apply_changes update "$WORKDIR/merged.txt"
+}
+
+# 菜单 2：查看与管理名单（预览、一键更新在线链接、改名、即刻确认删除）
+flow_manage() {
+  rm -rf "${PENDING:-}"
+  : >"$WORKDIR/del.list"
+  while :; do
+    source_dirs saved >"$WORKDIR/src.idx"
+    if [ ! -s "$WORKDIR/src.idx" ]; then
+      say_info "目前没有任何已保存的名单。"
+      return 0
+    fi
+    _fm_has_url=0
+    say_step "已保存的封禁名单"
+    _fm_i=0
+    while IFS= read -r _fm_d; do
+      _fm_i=$((_fm_i + 1))
+      show_source_line "$_fm_i" "$_fm_d"
+      [ "$(cat "$_fm_d/kind" 2>/dev/null)" = url ] && _fm_has_url=1
+    done <"$WORKDIR/src.idx"
+    say ""
+    if [ "$_fm_has_url" = 1 ]; then
+      say_dim "  输入编号可查看/更新/改名/删除某份名单；输入 u 一键更新全部在线链接；直接回车返回。"
+      ask "请选择编号 / u / 回车返回：" ""
+    else
+      ask "输入编号查看/改名/删除某份名单，直接回车返回：" ""
+    fi
+    [ -n "$ANSWER" ] || return 0
+    case $ANSWER in
+      0) return 0 ;;
+      u|U)
+        if [ "$_fm_has_url" = 1 ]; then
+          update_all_url_sources
+          pause_enter
+          continue
         fi
         ;;
     esac
-  fi
-}
-
-#----------------------------------------------------------------------
-# 交互流程
-#----------------------------------------------------------------------
-
-intro() {
-  [ -n "${OS_PRETTY:-}" ] || detect_os
-  _in_kb=$(mem_total_kb)
-  say ""
-  say "这个脚本让这台服务器访问不了你给出的域名、IP 或网段。"
-  say "系统：$OS_PRETTY    内存：$([ "$_in_kb" -gt 0 ] && echo "$((_in_kb / 1024)) MB" || echo 未知)"
-  say ""
-  say "名单支持这些写法，可以混着写："
-  say "  example.com    .example.com    *.example.com    1.2.3.4    1.2.3.0/24"
-  say "  DOMAIN-SUFFIX,example.com    IP-CIDR,1.2.3.0/24    0.0.0.0 example.com    ||example.com^"
-  say "  Clash 的 YAML 名单（payload:）"
-  say ""
-  say "用法很简单：加名单 → 确认。生效后，这台机器（包括你在上面搭的节点）"
-  say "就打不开名单里的网站和 App 了。"
-}
-
-# 第一次设置，或换一套新名单。
-# 第一次设置不问范围，直接封整台机器：新手最容易在这里把节点端口当成目标端口填进去。
-# 换一套名单时沿用原来的范围。要改范围去菜单里的“修改封禁范围”。
-flow_new() {
-  say_step "检查这台机器"
-  fw_precheck
-  say_step "第 1 步：添加名单"
-  collect_sources new
-  merge_sources "$WORKDIR/merged.txt"
-  MODE=$(cat "$CFG/mode" 2>/dev/null)
-  PORTS=$(cat "$CFG/ports" 2>/dev/null)
-  [ "$MODE" = ports ] || { MODE=all; PORTS=; }
-  say_step "第 2 步：确认"
-  show_plan "$WORKDIR/merged.txt"
-  confirm_or_cancel || return 0
-  apply_changes new "$WORKDIR/merged.txt"
-}
-
-flow_append() {
-  say_step "追加名单"
-  if ! collect_sources append; then
-    say_info "没有追加新名单。"
-    return 0
-  fi
-  merge_sources "$WORKDIR/merged.txt"
-  MODE=$(cat "$CFG/mode")
-  PORTS=$(cat "$CFG/ports" 2>/dev/null)
-  fw_precheck
-  show_plan "$WORKDIR/merged.txt"
-  confirm_or_cancel || return 0
-  apply_changes append "$WORKDIR/merged.txt"
-}
-
-flow_manage() {
-  : >"$WORKDIR/del.list"
-  manage_sources saved
-  [ -s "$WORKDIR/del.list" ] || return 0
-  _fm_n=$(count_lines "$WORKDIR/del.list")
-  if [ -z "$(source_dirs all)" ]; then
-    if ask_yn "名单全部删掉的话，封禁会关闭、名单清空。确定吗？[y/N]: " n; then
-      disable_all
-      remove_persistence
-      # resolved.last 是旧版本留下的域名解析结果，一起清掉。
-      rm -rf "$CFG/sources" "$CFG/list.txt" "$CFG/status.txt" "$CFG/v4" "$CFG/v6" \
-        "$CFG/dns.list" "$CFG/resolved.last"
-      printf '%s\n' 0 >"$CFG/enabled"
-      say_ok "已清空。再运行 vps-fengjin 可以重新设置。"
-      exit 0
+    _fm_d=""
+    case $ANSWER in
+      *[!0-9]*) ;;
+      *) _fm_d=$(sed -n "${ANSWER}p" "$WORKDIR/src.idx") ;;
+    esac
+    if [ -z "$_fm_d" ]; then
+      say_warn "没有这个编号，请重新输入。"
+      continue
     fi
-    : >"$WORKDIR/del.list"
-    say_info "没有删除。"
-    return 0
-  fi
-  if ! ask_yn "删除 $_fm_n 份名单，并用剩下的名单重新生效？[Y/n]: " y; then
-    : >"$WORKDIR/del.list"
-    say_info "没有删除。"
-    return 0
-  fi
-  merge_sources "$WORKDIR/merged.txt"
-  MODE=$(cat "$CFG/mode")
-  PORTS=$(cat "$CFG/ports" 2>/dev/null)
-  apply_changes delete "$WORKDIR/merged.txt"
+    _fm_name=$(cat "$_fm_d/name" 2>/dev/null)
+    _fm_kind=$(cat "$_fm_d/kind" 2>/dev/null)
+    say ""
+    say "${C_BOLD}操作名单「${_fm_name}」：${C_NC}"
+    say "  1) 预览名单里的内容（查看前 30 条）"
+    if [ "$_fm_kind" = url ] || [ "$_fm_kind" = file ]; then
+      say "  2) 重新拉取并更新这份名单"
+      say "  3) 修改备注名"
+      say "  4) 删除这份名单"
+      say "  0) 返回"
+      ask_pick "请选择 [0]: " 0 1 2 3 4 0
+    else
+      say "  2) 修改备注名"
+      say "  3) 删除这份名单"
+      say "  0) 返回"
+      ask_pick "请选择 [0]: " 0 1 2 3 0
+      # 统一映射操作码，避免分支错乱
+      case $ANSWER in
+        2) ANSWER=3 ;;
+        3) ANSWER=4 ;;
+      esac
+    fi
+    case $ANSWER in
+      1)
+        preview_source "$_fm_d"
+        pause_enter
+        ;;
+      2)
+        rm -rf "$WORKDIR/upd_stage"
+        if refresh_single_source "$_fm_d"; then
+          merge_with_updates "$WORKDIR/merged.txt"
+          MODE=$(cat "$CFG/mode" 2>/dev/null || echo all)
+          PORTS=$(cat "$CFG/ports" 2>/dev/null)
+          apply_changes update "$WORKDIR/merged.txt"
+        fi
+        pause_enter
+        ;;
+      3)
+        ask "请输入新的备注名（原名「${_fm_name}」，回车不改）：" ""
+        _fm_new=$(clean_name "$ANSWER")
+        if [ -n "$_fm_new" ]; then
+          printf '%s\n' "$_fm_new" >"$_fm_d/name"
+          say_ok "已改名为「${_fm_new}」"
+          [ -f "$CFG/mode" ] && write_status
+        fi
+        ;;
+      4)
+        _fm_total=$(count_sources saved)
+        if [ "$_fm_total" -le 1 ]; then
+          say_warn "「${_fm_name}」是最后一份名单，删除后将关闭封禁并清空所有规则。"
+          if ask_yn "确定删除并清空吗？[y/N]: " n; then
+            disable_all
+            remove_persistence
+            rm -rf "$CFG/sources" "$CFG/list.txt" "$CFG/status.txt" "$CFG/v4" "$CFG/v6" \
+              "$CFG/dns.list" "$CFG/resolved.last" "$CFG/mode" "$CFG/ports" \
+              "$CFG/backend" "$CFG/dns.method" "$CFG/v4.active" "$CFG/v6.active"
+            printf '%s\n' 0 >"$CFG/enabled"
+            say_ok "已清空所有名单并关闭封禁。随时运行 vps-fengjin 可重新设置。"
+            exit 0
+          fi
+        else
+          if ask_yn "确定删除「${_fm_name}」并立即用剩余名单重新生效吗？[y/N]: " n; then
+            printf '%s\n' "$_fm_d" >"$WORKDIR/del.list"
+            merge_sources all "$WORKDIR/merged.txt"
+            MODE=$(cat "$CFG/mode" 2>/dev/null || echo all)
+            PORTS=$(cat "$CFG/ports" 2>/dev/null)
+            apply_changes delete "$WORKDIR/merged.txt"
+            pause_enter
+          fi
+        fi
+        ;;
+    esac
+  done
 }
 
+# 菜单 3：测试某个网站或 IP 是否已被封住
+flow_test() {
+  say_step "测试某个网站或 IP 是否已被封住"
+  say_dim "  输入要检查的域名或 IP（如 baidu.com、https://www.qq.com、1.2.3.4），直接回车返回。"
+  while :; do
+    ask "请输入要测试的目标（回车返回）：" ""
+    [ -n "$ANSWER" ] || return 0
+    cmd_test "$ANSWER"
+    say ""
+  done
+}
+
+# 菜单 7：高级设置（修改封禁范围）
 flow_scope() {
   fw_precheck
   if [ "$FW_BACKEND" = none ]; then
-    say_info "这台机器只能拦域名，分不了端口，没有范围可改。"
+    say ""
+    say_info "当前机器没有修改防火墙权限，只能全局封禁域名，无法按端口设置。"
     return 0
   fi
-  ask_scope "$(cat "$CFG/mode")" "$(cat "$CFG/ports" 2>/dev/null)"
-  show_plan "$CFG/list.txt"
-  confirm_or_cancel || return 0
-  apply_changes keep ""
+  _fs_cur_m=$(cat "$CFG/mode" 2>/dev/null || echo all)
+  _fs_cur_p=$(cat "$CFG/ports" 2>/dev/null)
+  ask_scope "$_fs_cur_m" "$_fs_cur_p" || return 0
+  show_plan_summary "$CFG/list.txt"
+  if ask_yn "确认应用新的封禁范围吗？[Y/n]: " y; then
+    apply_changes keep ""
+  else
+    say_info "已取消，未作改动。"
+  fi
 }
 
 flow_reapply() {
-  MODE=$(cat "$CFG/mode")
+  MODE=$(cat "$CFG/mode" 2>/dev/null || echo all)
   PORTS=$(cat "$CFG/ports" 2>/dev/null)
   apply_changes keep ""
 }
 
 cmd_off() {
   if [ ! -d "$CFG" ]; then
-    say_info "这台机器还没有封禁记录。"
+    say_info "这台服务器还没有配置封禁。"
     return 0
   fi
   printf '%s\n' 0 >"$CFG/enabled"
   disable_all
   [ -f "$CFG/list.txt" ] && write_status
-  say_ok "已关闭，名单还在。要再打开：vps-fengjin on"
+  say_ok "已暂停封禁，所有名单均已保留。随时运行 vps-fengjin on 或在菜单中即可重新开启。"
 }
 
 cmd_purge() {
-  # dnsmasq_clear 要读 $CFG 里的记录，必须在删目录之前。
   disable_all
   remove_persistence
-  if [ -f "$CFG/dnsmasq.confdir" ] && [ -f /etc/dnsmasq.conf ]; then
-    grep -vxF 'conf-dir=/etc/dnsmasq.d/,*.conf' /etc/dnsmasq.conf >"$WORKDIR/dnsmasq.conf.new"
-    cat "$WORKDIR/dnsmasq.conf.new" >/etc/dnsmasq.conf
-  fi
   if [ -f /swapfile-vps-fengjin ]; then
     swapoff /swapfile-vps-fengjin 2>/dev/null
     rm -f /swapfile-vps-fengjin
@@ -2649,44 +3563,53 @@ cmd_purge() {
     fi
   fi
   rm -rf "$CFG"
-  rm -f "$BIN_DEFAULT" /usr/sbin/vps-fengjin
-  say_ok "已彻底删除。"
+  rm -f "$BIN_DEFAULT" "$BIN_LINK" /usr/sbin/vps-fengjin
+  say_ok "已彻底卸载：所有封禁规则、名单、开机自启与快捷命令均已清理干净。"
 }
 
 menu() {
   while :; do
-    say ""
-    say "===================="
-    show_status
-    say "===================="
-    say "  1) 重新生效（按保存的名单重新封，换上当前版本的规则）"
-    say "  2) 追加名单"
-    say "  3) 管理名单（查看、改名、删除）"
-    say "  4) 换一套新名单"
-    say "  5) 修改封禁范围（高级，一般用不到）"
-    say "  6) 关闭封禁，名单留着"
-    say "  7) 彻底删除"
+    show_dashboard
+    _mn_en=$(cat "$CFG/enabled" 2>/dev/null || echo 0)
+    say "  1) 添加封禁（输入域名 / IP、导入链接或文件）"
+    say "  2) 查看与管理名单（预览内容 / 更新在线链接 / 改名 / 删除）"
+    say "  3) 测试某个网站或 IP 是否已被封住"
+    say "  4) 立即重新生效 / 刷新规则"
+    if [ "$_mn_en" = 1 ]; then
+      say "  5) 暂停封禁（保留名单，随时可恢复）"
+    else
+      say "  5) ${C_GREEN}开启封禁（立即按已存名单生效）${C_NC}"
+    fi
+    say "  6) 更换整套名单（清空旧名单并重新添加）"
+    say "  7) 高级设置（修改封禁范围：全局 / 指定目标端口）"
+    say "  8) 彻底卸载（清除所有规则、名单与自启）"
     say "  0) 退出"
-    ask_pick "请选择 [0]: " 0 1 2 3 4 5 6 7 0
+    ui_hr
+    ask_pick "请选择功能 [0]: " 0 1 2 3 4 5 6 7 8 0
     case $ANSWER in
-      1) flow_reapply ;;
-      2) flow_append ;;
-      3) flow_manage ;;
-      4) flow_new ;;
-      5) flow_scope ;;
-      6)
-        if [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ]; then
+      1) flow_append; pause_enter ;;
+      2) flow_manage ;;
+      3) flow_test ;;
+      4) flow_reapply; pause_enter ;;
+      5)
+        if [ "$_mn_en" = 1 ]; then
           cmd_off
         else
-          say_info "封禁本来就是关着的。选 1 可以重新打开。"
+          flow_reapply
         fi
+        pause_enter
         ;;
-      7)
-        if ask_yn "彻底删除名单、规则和开机自启？[y/N]: " n; then
+      6) flow_replace; pause_enter ;;
+      7) flow_scope; pause_enter ;;
+      8)
+        say ""
+        say_warn "彻底卸载会清除所有封禁规则、已保存名单、定时巡检和 vps-fengjin 命令。"
+        if ask_yn "确定要彻底卸载吗？[y/N]: " n; then
           cmd_purge
           return 0
         fi
-        say_info "已取消。"
+        say_info "已取消卸载。"
+        pause_enter
         ;;
       0) return 0 ;;
     esac
@@ -2694,32 +3617,41 @@ menu() {
 }
 
 #----------------------------------------------------------------------
-# 不提问的运行方式：sh install.sh -l 名单 [-p 端口 | -a] [--replace] -y
+# 非交互参数模式：sh install.sh -l 名单 [-p 端口 | -a] [--replace] -y
 #----------------------------------------------------------------------
 
+confirm_cli() {
+  [ "${OPT_YES:-0}" = 1 ] && return 0
+  if ask_yn "确认立即生效？[y/N]: " n; then
+    return 0
+  fi
+  say_info "已取消，未做任何改动。"
+  return 1
+}
+
 unattended() {
+  if [ "${OPT_REPLACE:-0}" = 1 ] && [ ! -s "$WORKDIR/opt.lists" ]; then
+    die "使用 --replace 时必须同时用 -l 指定新名单。"
+  fi
   if [ -s "$WORKDIR/opt.lists" ]; then
     PENDING=$WORKDIR/sources
     rm -rf "$PENDING"
     mkdir -p "$PENDING"
     while IFS= read -r _un_src; do
-      add_from "$_un_src" || die "名单「$_un_src」没有加进去，什么都没改。"
+      add_from "$_un_src" || die "名单「${_un_src}」导入失败，已中止，未做任何改动。"
     done <"$WORKDIR/opt.lists"
     _un_how=append
     if [ ! -f "$CFG/list.txt" ] || [ "${OPT_REPLACE:-0}" = 1 ]; then
       _un_how=new
     fi
   else
-    [ -f "$CFG/list.txt" ] || die "还没有名单。用 -l 指定名单网址或文件，例如：sh install.sh -l https://example.com/list.txt -y"
+    [ -f "$CFG/list.txt" ] || die "还没有名单。请用 -l 指定名单网址或文件，例如：sh install.sh -l https://example.com/list.txt -y"
     _un_how=keep
   fi
   if [ "$_un_how" = new ]; then
-    # 换一套：合并时不带原来的名单。
-    source_dirs pending | while IFS= read -r _un_d; do cat "$_un_d/list"; done \
-      | LC_ALL=C sort -u >"$WORKDIR/merged.txt"
-    cap_list "$WORKDIR/merged.txt"
+    merge_sources pending "$WORKDIR/merged.txt"
   elif [ "$_un_how" = append ]; then
-    merge_sources "$WORKDIR/merged.txt"
+    merge_sources all "$WORKDIR/merged.txt"
   else
     cp "$CFG/list.txt" "$WORKDIR/merged.txt"
   fi
@@ -2727,13 +3659,13 @@ unattended() {
   [ -n "$MODE" ] || MODE=all
   if [ "$MODE" = ports ]; then
     PORTS=${OPT_PORTS:-$(cat "$CFG/ports" 2>/dev/null)}
-    [ -n "$PORTS" ] || die "按端口封需要用 -p 指定端口。"
+    [ -n "$PORTS" ] || die "按端口封禁必须用 -p 指定端口，例如 -p 80,443。"
   else
     PORTS=
   fi
   fw_precheck
-  show_plan "$WORKDIR/merged.txt"
-  confirm_or_cancel || exit 0
+  show_plan_summary "$WORKDIR/merged.txt"
+  confirm_cli || exit 0
   if [ "$_un_how" = keep ]; then
     apply_changes keep ""
   else
@@ -2744,10 +3676,14 @@ unattended() {
 parse_opts() {
   : >"$WORKDIR/opt.lists"
   OPT_GIVEN=0
+  OPT_REPLACE=0
+  OPT_YES=0
+  OPT_MODE=
+  OPT_PORTS=
   while [ $# -gt 0 ]; do
     case $1 in
       -l|--list)
-        [ $# -ge 2 ] || die "$1 后面要跟名单网址或文件路径。"
+        [ $# -ge 2 ] || die "$1 后面需要跟名单链接或文件路径。"
         printf '%s\n' "$2" >>"$WORKDIR/opt.lists"
         shift 2
         ;;
@@ -2756,13 +3692,13 @@ parse_opts() {
         shift
         ;;
       -p|--ports)
-        [ $# -ge 2 ] || die "$1 后面要跟端口，例如 80,443。"
-        OPT_PORTS=$(parse_ports "$2") || die "端口不对：$2（1 到 65535，最多 30 个）"
+        [ $# -ge 2 ] || die "$1 后面需要跟端口号，例如 80,443。"
+        OPT_PORTS=$(parse_ports "$2") || die "端口格式不对：${2}（1~65535，最多 30 个）"
         OPT_MODE=ports
         shift 2
         ;;
       --ports=*)
-        OPT_PORTS=$(parse_ports "${1#--ports=}") || die "端口不对：${1#--ports=}"
+        OPT_PORTS=$(parse_ports "${1#--ports=}") || die "端口格式不对：${1#--ports=}"
         OPT_MODE=ports
         shift
         ;;
@@ -2790,55 +3726,51 @@ parse_opts() {
 usage() {
   cat <<EOF
 用法：
-  sh install.sh                     按提示设置；已经设置过就打开菜单
-  sh install.sh [选项]               不用菜单，按参数设置
-  vps-fengjin status                查看
+  vps-fengjin                       首次进入引导设置；已设置则打开管理菜单
+  vps-fengjin [选项]                 不进菜单，直接用参数设置
+  vps-fengjin status                查看当前状态与规则健康检查
+  vps-fengjin test 域名或IP          测试某个网站或 IP 是否已被封住
+  vps-fengjin update-lists          重新下载所有在线链接名单并生效
   vps-fengjin refresh               按保存的名单重新封一次
-  vps-fengjin on | off              打开 / 关闭，名单留着
-  vps-fengjin purge                 彻底删除
-  sh install.sh check 文件           只检查名单，不改防火墙
+  vps-fengjin on | off              开启 / 暂停封禁（名单保留）
+  vps-fengjin purge                 彻底卸载
+  vps-fengjin check 文件或网址       仅检查名单内容，不修改防火墙
 
 选项：
-  -l, --list 名单    名单网址或文件路径，可以写多次；写 - 表示从标准输入读
-  -a, --all          封整台机器（默认）
-  -p, --ports 端口   只封这些目标端口，例如 80,443
-      --replace      换掉原来的名单（默认是追加到原来的名单里）
-  -y, --yes          不再确认，直接生效
+  -l, --list 名单    名单链接或本地文件路径，可多次指定；写 - 表示从标准输入读
+  -a, --all          全局封禁（默认）
+  -p, --ports 端口   仅封指定目标端口，例如 80,443（高级，仅对 IP/网段生效）
+      --replace      替换掉原有全部名单（默认是追加）
+  -y, --yes          跳过确认，直接生效
 
-例子：
+示例：
   sh install.sh -l https://example.com/block.list -y
-  sh install.sh -l /root/a.txt -l /root/b.txt -p 443 --replace -y
+  sh install.sh -l /root/a.txt -l /root/b.txt --replace -y
 EOF
 }
 
 #----------------------------------------------------------------------
-# 入口
+# 锁管理与入口
 #----------------------------------------------------------------------
 
 require_root() {
-  [ "$(id -u)" = 0 ] || die "请用 root 运行。例如：sudo sh install.sh"
+  [ "$(id -u)" = 0 ] || die "请使用 root 权限运行，例如：sudo sh install.sh"
 }
 
 require_linux() {
-  [ "$(uname -s)" = Linux ] || die "请在 Linux 服务器上运行。"
+  [ "$(uname -s)" = Linux ] || die "此脚本只能在 Linux 服务器上运行。"
 }
 
-# 进程的开机后启动时刻（/proc/PID/stat 第 22 项）。读不到就输出空。
-# PID 会被别的程序重新用上，靠它才能认出「这还是不是当初占锁的那个进程」。
 proc_start() {
   sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk 'NR == 1 { print $20 }'
 }
 
-# 占锁的进程还在不在。在返回 0。
-# 光看 PID 活着不够：上次被强杀 / 机器或容器重启后锁目录留了下来，
-# 同一个 PID 很可能已经是别的程序，那样会一直误报「另一个任务正在跑」。
 lock_alive() {
   LOCK_PID=$(sed -n 1p "$LOCKDIR/pid" 2>/dev/null | tr -cd '0-9')
   LOCK_CMD=$(sed -n 1p "$LOCKDIR/cmd" 2>/dev/null)
   [ -n "$LOCK_PID" ] || return 1
   kill -0 "$LOCK_PID" 2>/dev/null || return 1
   _la_now=$(proc_start "$LOCK_PID")
-  # 没有 /proc 可查，只能信 PID，但不敢确定它就是本脚本。
   LOCK_SURE=0
   [ -n "$_la_now" ] || return 0
   LOCK_SURE=1
@@ -2847,18 +3779,12 @@ lock_alive() {
     [ "$_la_then" = "$_la_now" ]
     return
   fi
-  # 旧版本留下的锁没记启动时刻，看命令行像不像本脚本。
   case $(tr '\000' ' ' <"/proc/$LOCK_PID/cmdline" 2>/dev/null) in
     *fengjin*|*install.sh*) return 0 ;;
   esac
   return 1
 }
 
-# take_lock [这次在做什么]。拿到返回 0；被别的任务占着返回 1，
-# 这时 LOCK_PID / LOCK_CMD 是占着锁的那个任务。
-# 只有「确实有个活着的本脚本进程占着」才算被占。锁目录建不出来、
-# 残留的删不掉（有的容器 /run 看着可写其实不让写），都不是别人在跑：
-# 换下一个位置，全都不行就不加锁直接干，不能因此把人挡在外面。
 LOCK_BASES="/run /tmp"
 take_lock() {
   LOCKED=0
@@ -2876,9 +3802,7 @@ take_lock() {
         rm -rf "$LOCKDIR" 2>/dev/null
         break
       fi
-      # 目录不存在却建不出来：这个位置不能用。
       [ -d "$LOCKDIR" ] || break
-      # 对方可能刚建好目录还没写 pid，等一下再判断，免得把活锁当死锁删掉。
       [ -s "$LOCKDIR/pid" ] || sleep 1
       lock_alive && return 1
       rm -rf "$LOCKDIR" 2>/dev/null
@@ -2889,9 +3813,6 @@ take_lock() {
   return 0
 }
 
-# 设置类命令用，一定拿得到锁：人在这个窗口里等着用，以这里为准。
-# 后台的定时刷新 / 开机恢复很快会结束，先等它；
-# 别的窗口里开着的（或者等不完的）直接关掉，在这里继续。
 take_lock_or_die() {
   _tw=0
   _tk=0
@@ -2899,7 +3820,7 @@ take_lock_or_die() {
     case ${LOCK_CMD:-} in
       refresh|apply|apply-rules)
         if [ "$_tw" -lt "${LOCK_WAIT:-180}" ]; then
-          [ "$_tw" = 0 ] && say_info "后台正在刷新封禁地址（进程 $LOCK_PID），等它结束，一般不超过一两分钟……"
+          [ "$_tw" = 0 ] && say_info "后台定时巡检正在运行（进程 ${LOCK_PID}），等待完成..."
           sleep 2
           _tw=$((_tw + 2))
           continue
@@ -2907,14 +3828,13 @@ take_lock_or_die() {
         ;;
     esac
     _tk=$((_tk + 1))
-    # 关了几次还占着，不再纠缠，不加锁继续。
     if [ "$_tk" -gt 3 ]; then
       LOCKED=0
       LOCKDIR=
       return 0
     fi
     if [ "${LOCK_SURE:-0}" = 1 ]; then
-      say_warn "另一个 vps-fengjin 任务还占着（进程 $LOCK_PID，多半是别的窗口没退出），已把它关掉，在这里继续。"
+      say_warn "检测到另一个窗口正在运行 vps-fengjin（进程 ${LOCK_PID}），已自动接管。"
       kill "$LOCK_PID" 2>/dev/null
       for _ti in 1 2 3 4 5 6; do
         kill -0 "$LOCK_PID" 2>/dev/null || break
@@ -2922,8 +3842,7 @@ take_lock_or_die() {
       done
       kill -9 "$LOCK_PID" 2>/dev/null
     else
-      # 认不准那个进程号是不是本脚本，不乱杀，只把锁接过来。
-      say_warn "发现另一个 vps-fengjin 任务留下的锁，已接管，在这里继续。"
+      say_warn "发现残留锁文件，已自动接管继续运行。"
     fi
     [ -n "${LOCKDIR:-}" ] && rm -rf "$LOCKDIR" 2>/dev/null
   done
@@ -2931,7 +3850,9 @@ take_lock_or_die() {
 
 cleanup() {
   [ -n "${WORKDIR:-}" ] && [ "$WORKDIR" != / ] && rm -rf "$WORKDIR"
-  [ "${LOCKED:-0}" = 1 ] && [ -n "${LOCKDIR:-}" ] && rm -rf "$LOCKDIR"
+  if [ "${LOCKED:-0}" = 1 ] && [ -n "${LOCKDIR:-}" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ]; then
+    rm -rf "$LOCKDIR"
+  fi
 }
 
 make_workdir() {
@@ -2943,11 +3864,9 @@ make_workdir() {
   fi
   LOCKED=0
   trap cleanup EXIT
-  # HUP：SSH 断线时也要走 cleanup，不然锁会留下。
   trap 'exit 130' INT TERM HUP
 }
 
-# 设置类命令都要的准备：root、Linux、锁、把自己装成 vps-fengjin 命令。
 prepare_setup() {
   require_linux
   require_root
@@ -2955,12 +3874,15 @@ prepare_setup() {
   detect_os
   _pr_old=$(sed -n 's/^VERSION=//p' "$(installed_bin)" 2>/dev/null | head -n 1)
   install_self
+  UPGRADED=0
   if [ -n "$_pr_old" ] && [ "$_pr_old" != "$VERSION" ]; then
-    say_ok "已从 $_pr_old 更新到 $VERSION，名单和设置都还在。"
+    say_ok "脚本已从 v$_pr_old 更新到 v${VERSION}（原有配置和名单完整保留）"
     UPGRADED=1
   fi
   migrate_sources
-  [ -f "$CFG/mode" ] && [ -f "$CFG/list.txt" ] && write_status
+  if [ "${UPGRADED:-0}" != 1 ] && [ -f "$CFG/mode" ] && [ -f "$CFG/list.txt" ]; then
+    write_status
+  fi
 }
 
 main() {
@@ -2975,18 +3897,30 @@ main() {
       ;;
     status)
       show_status
-      [ -f "$CFG/status.txt" ] && say "" && say "改名单或范围：vps-fengjin    关闭：vps-fengjin off"
+      [ -f "$CFG/status.txt" ] && say "" && say_dim "管理菜单：vps-fengjin  |  测试拦截：vps-fengjin test baidu.com  |  暂停：vps-fengjin off"
+      ;;
+    test)
+      [ -n "${2:-}" ] || die "用法：vps-fengjin test 域名或IP（例如：vps-fengjin test baidu.com）"
+      cmd_test "$2"
       ;;
     check)
-      [ -n "${2:-}" ] || die "用法：sh install.sh check 名单文件"
-      [ -f "$2" ] || die "找不到文件：$2"
-      fengjin_awk classify <"$2" >"$WORKDIR/check.all"
+      [ -n "${2:-}" ] || die "用法：vps-fengjin check 名单文件或网址"
+      read_source "$2" "$WORKDIR/check.raw" || exit 1
+      fengjin_awk classify <"$WORKDIR/check.raw" >"$WORKDIR/check.all"
       summarize_list "$WORKDIR/check.all"
-      say "域名 $N_DOMAIN 个，整段后缀 $N_SUFFIX 个，IP / 网段 $N_IP 个，跳过 $N_BAD 行"
+      say_ok "解析结果：有效域名 $((N_DOMAIN + N_SUFFIX)) 个，IP / 网段 $N_IP 个，跳过 $N_BAD 行"
       show_bads "$WORKDIR/check.all"
       ;;
+    update-lists)
+      require_linux
+      require_root
+      [ -f "$CFG/list.txt" ] || die "还没有配置封禁名单。"
+      take_lock_or_die update
+      detect_os
+      migrate_sources
+      update_all_url_sources
+      ;;
     apply-rules)
-      # 开机时用：按保存的结果直接封，不装软件、不改 DNS 设置（那些本来就留着）。
       require_linux
       require_root
       [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ] || exit 0
@@ -2997,20 +3931,20 @@ main() {
     refresh|apply)
       require_linux
       require_root
-      [ -f "$CFG/list.txt" ] || die "还没有名单。"
+      [ -f "$CFG/list.txt" ] || die "还没有配置封禁名单。"
       if [ "$(cat "$CFG/enabled" 2>/dev/null)" != 1 ]; then
-        say_info "封禁是关着的，没有刷新。"
+        say_info "封禁当前处于暂停状态，未刷新。"
         exit 0
       fi
-      take_lock refresh || { say_warn "另一个 vps-fengjin 任务正在跑，这次跳过。"; exit 0; }
+      take_lock refresh || { say_warn "另一个 vps-fengjin 任务正在运行，本次跳过。"; exit 0; }
       detect_os
       activate refresh
-      say_ok "已刷新：IPv4 $(count_lines "$CFG/v4") 条，IPv6 $(count_lines "$CFG/v6") 条。"
+      say_ok "规则已刷新：域名 $(count_lines "$CFG/dns.list") 个，IPv4 $(count_lines "$CFG/v4") 条，IPv6 $(count_lines "$CFG/v6") 条。"
       ;;
     on)
       require_linux
       require_root
-      [ -f "$CFG/list.txt" ] || die "还没有名单。运行 sh install.sh 设置。"
+      [ -f "$CFG/list.txt" ] || die "还没有配置名单，请直接运行 vps-fengjin 开始设置。"
       take_lock_or_die on
       detect_os
       flow_reapply || exit 1
@@ -3034,18 +3968,17 @@ main() {
         unattended
       elif [ -f "$CFG/list.txt" ] && [ -f "$CFG/mode" ]; then
         if [ "${UPGRADED:-0}" = 1 ] && [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ]; then
-          if ask_yn "现在用新版本重新生效一次吗？[Y/n]: " y; then
+          if ask_yn "检测到版本升级，是否立刻用新版本规则重新生效一次？[Y/n]: " y; then
             flow_reapply
+          else
+            write_status
           fi
         fi
         menu
       else
-        intro
-        if flow_new && [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ]; then
+        if flow_first_setup && [ "$(cat "$CFG/enabled" 2>/dev/null)" = 1 ]; then
           say ""
-          show_status
-          say ""
-          say "以后运行 vps-fengjin 可以追加名单、改范围、关闭；vps-fengjin status 查看。"
+          say_dim "以后随时输入 vps-fengjin 打开管理菜单，或输入 vps-fengjin test baidu.com 验证拦截效果。"
         fi
       fi
       ;;
